@@ -76,7 +76,12 @@ def evaluate(model: PPO, data: pd.DataFrame, label: str) -> dict:
     return result
 
 
-def train(ticker: str, timesteps: int = DEFAULT_TIMESTEPS, period: str = "730d") -> Path:
+def train(
+    ticker: str,
+    timesteps: int = DEFAULT_TIMESTEPS,
+    period: str = "730d",
+    resume: bool = False,
+) -> Path:
     data = load_hourly_data(ticker, period)
     # Keep the final 145-day block completely untouched for the final test.
     if len(data) <= EPISODE_HOURS + LOOKBACK + 100:
@@ -105,6 +110,7 @@ def train(ticker: str, timesteps: int = DEFAULT_TIMESTEPS, period: str = "730d")
     eval_dir.mkdir(exist_ok=True)
     best_dir = out_dir / "best"
     best_dir.mkdir(exist_ok=True)
+    path = out_dir / f"ppo_options_{ticker.lower()}"
 
     callback = EvalCallback(
         eval_env,
@@ -116,23 +122,34 @@ def train(ticker: str, timesteps: int = DEFAULT_TIMESTEPS, period: str = "730d")
         verbose=1,
     )
 
-    model = PPO(
-        "MlpPolicy",
-        train_env,
-        learning_rate=3e-4,
-        n_steps=2048,
-        batch_size=256,
-        gamma=0.995,
-        gae_lambda=0.95,
-        ent_coef=0.01,
-        clip_range=0.2,
-        verbose=1,
-        seed=42,
-        device="auto",
-    )
-    model.learn(total_timesteps=timesteps, callback=callback, progress_bar=True)
+    if resume:
+        model_file = Path(f"{path}.zip")
+        if not model_file.exists():
+            raise FileNotFoundError(
+                f"Cannot resume: existing model not found at {model_file}. "
+                "Run once without --resume to create it."
+            )
+        print(f"Resuming existing model: {model_file}")
+        model = PPO.load(path, env=train_env, device="auto")
+        print(f"Continuing training for {timesteps:,} additional timesteps.")
+    else:
+        model = PPO(
+            "MlpPolicy",
+            train_env,
+            learning_rate=3e-4,
+            n_steps=2048,
+            batch_size=256,
+            gamma=0.995,
+            gae_lambda=0.95,
+            ent_coef=0.01,
+            clip_range=0.2,
+            verbose=1,
+            seed=42,
+            device="auto",
+        )
+        print(f"Starting new PPO model for {timesteps:,} timesteps.")
 
-    path = out_dir / f"ppo_options_{ticker.lower()}"
+    model.learn(total_timesteps=timesteps, callback=callback, progress_bar=True, reset_num_timesteps=not resume)
     model.save(path)
     result = evaluate(model, test_data, "final")
 
@@ -154,8 +171,13 @@ def main() -> None:
     parser.add_argument("--ticker", default="SPY")
     parser.add_argument("--timesteps", type=int, default=DEFAULT_TIMESTEPS)
     parser.add_argument("--period", default="730d")
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Continue training the existing saved model instead of starting from scratch.",
+    )
     args = parser.parse_args()
-    train(args.ticker.upper(), args.timesteps, args.period)
+    train(args.ticker.upper(), args.timesteps, args.period, args.resume)
 
 
 if __name__ == "__main__":
