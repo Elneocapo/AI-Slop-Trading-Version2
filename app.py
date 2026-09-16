@@ -1,8 +1,11 @@
-"""Streamlit entrypoint for BrokerIA.
+"""BrokerIA desktop entrypoint.
 
 Run from the repository root with:
-    streamlit run app.py
+    python app.py
 """
 
-# Importing the dashboard module starts the Streamlit UI.
-import app.ui.dashboard  # noqa: F401,E402
+from app.ui.desktop import main
+
+
+if __name__ == "__main__":
+    main()
