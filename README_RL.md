@@ -1,46 +1,57 @@
 # AI Options Trainer
 
-The core experiment is now a reinforcement-learning agent that learns simulated options decisions from **1-hour candles**.
+The core experiment is a reinforcement-learning agent that learns simulated options decisions from **1-hour candles**.
 
-## Current training setup
+## Training design
 
-- Starting capital: **€500**
-- Market data: hourly OHLCV
-- Agent: PPO (Stable-Baselines3)
-- Actions: hold, buy call, buy put, close position
-- Reward: change in simulated equity, normalized by the €500 starting capital, with a small drawdown penalty
-- Training/test split: chronological 80/20 split
-- Test data is never used for training
-- Model output: `models/ppo_options_<ticker>.zip`
+At every decision point the agent receives the **previous 60 hourly candles** plus its portfolio state. It then chooses the action for the next hourly step:
 
-## Important data model
+- `HOLD`
+- `BUY_CALL`
+- `BUY_PUT`
+- `SELL_CALL` (open a short call)
+- `SELL_PUT` (open a short put)
+- `CLOSE`
 
-The current Yahoo Finance source provides historical hourly **underlying** prices, but not a complete historical hourly options-chain archive. Therefore the training environment uses real historical hourly underlying candles and generates synthetic option prices with a Black-Scholes model and estimated volatility. This makes the first trainer reproducible, but it is **not equivalent to training on historical option quotes**.
+Each episode is approximately **145 trading days (~1,015 hourly steps)** and starts with **€500**. The environment advances one hourly candle at a time until the episode ends.
 
-The synthetic layer is intentionally isolated in `app/environment/options_env.py` so a historical options dataset can replace it later without changing the PPO agent interface.
+The reward is primarily the change in account equity. A small drawdown penalty is included so the policy is not rewarded purely for taking extreme risk. Short options use simulated margin so the €500 account cannot create unlimited leverage.
 
-## Run
+## Training until a strong policy is found
 
-Install the RL dependencies:
+The default local run is **5,000,000 PPO timesteps**. Evaluation is performed every 50,000 steps and the best checkpoint is saved to:
+
+```text
+models/best/best_model.zip
+```
+
+The final model is saved to:
+
+```text
+models/ppo_options_<ticker>.zip
+```
+
+Run locally:
 
 ```bash
 pip install -r requirements-rl.txt
+python train_ai.py --ticker SPY --timesteps 5000000
 ```
 
-Train for 200,000 steps on SPY:
+For a longer run, simply increase `--timesteps`, for example `10000000` or `20000000`.
 
-```bash
-python train_ai.py --ticker SPY --timesteps 200000
-```
+## 145-day test
 
-You can use another ticker, for example:
+The final **145-day block of historical data is held out completely from training**. After training, the model is released into that untouched chronological block, starting with €500 and the same 60-candle lookback. The program reports final equity, P&L and return.
 
-```bash
-python train_ai.py --ticker NVDA --timesteps 200000
-```
+This is the important test: the model does not get to train on the candles it is subsequently tested on.
 
-The environment starts each episode with €500 and the agent's reward is tied to changes in simulated equity. The final chronological test period is reported separately after training.
+## Data limitation
 
-## Safety
+Yahoo Finance provides historical hourly **underlying** OHLCV, but not a complete historical hourly options-chain archive. The simulator therefore prices options with Black-Scholes using the historical underlying and estimated volatility. Those are **synthetic option quotes**, not claimed historical option transactions.
+
+The synthetic options layer is isolated in `app/environment/options_env.py`, so a proper historical options dataset can replace it later without changing the PPO interface.
+
+## No broker connection
 
 There is no broker/API execution path in this trainer. It is simulation and research only.
