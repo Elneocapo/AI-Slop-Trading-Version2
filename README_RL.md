@@ -31,7 +31,7 @@ The final model is saved to:
 models/ppo_options_<ticker>.zip
 ```
 
-Run locally:
+Run locally from scratch:
 
 ```bash
 pip install -r requirements-rl.txt
@@ -39,6 +39,22 @@ python train_ai.py --ticker SPY --timesteps 5000000
 ```
 
 For a longer run, simply increase `--timesteps`, for example `10000000` or `20000000`.
+
+## Incremental / cumulative training
+
+The trainer can continue from an existing model instead of resetting its learned policy. This preserves the PPO policy and optimizer state and adds more training experience on top of the existing model.
+
+After a model has already been created, continue training it with:
+
+```bash
+python train_ai.py --ticker SPY --timesteps 1000000 --resume
+```
+
+The `--timesteps` value is **additional** training, not the new lifetime total. For example, a model trained for 5M steps and then resumed for another 1M has received approximately 6M PPO timesteps in total.
+
+This is useful when new market data becomes available: the model can be updated without throwing away everything it previously learned. The final 145-day chronological holdout remains excluded from training on each run.
+
+For safety, `--resume` refuses to run if the saved model does not exist. A normal run without `--resume` starts a fresh model.
 
 ## 145-day test
 
