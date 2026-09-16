@@ -7,9 +7,15 @@ import numpy as np
 import pandas as pd
 import yfinance as yf
 from stable_baselines3 import PPO
+from stable_baselines3.common.callbacks import EvalCallback
 from stable_baselines3.common.monitor import Monitor
 
 from app.environment.options_env import OptionsTradingEnv
+
+
+EPISODE_HOURS = 145 * 7
+LOOKBACK = 60
+DEFAULT_TIMESTEPS = 5_000_000
 
 
 def load_hourly_data(ticker: str, period: str = "730d") -> pd.DataFrame:
@@ -43,18 +49,78 @@ def load_hourly_data(ticker: str, period: str = "730d") -> pd.DataFrame:
     return df.dropna().reset_index(drop=True)
 
 
-def train(ticker: str, timesteps: int, period: str = "730d") -> Path:
-    data = load_hourly_data(ticker, period)
-    split = int(len(data) * 0.8)
-    train_data = data.iloc[:split].reset_index(drop=True)
-    test_data = data.iloc[split:].reset_index(drop=True)
+def evaluate(model: PPO, data: pd.DataFrame, label: str) -> dict:
+    env = OptionsTradingEnv(
+        data,
+        initial_cash=500.0,
+        lookback=LOOKBACK,
+        episode_hours=EPISODE_HOURS,
+        fixed_start=LOOKBACK,
+    )
+    obs, _ = env.reset(seed=123)
+    terminated = False
+    actions = []
+    while not terminated:
+        action, _ = model.predict(obs, deterministic=True)
+        actions.append(int(action))
+        obs, _, terminated, _, info = env.step(int(action))
+    result = {
+        "label": label,
+        "initial": 500.0,
+        "final": float(env.equity),
+        "pnl": float(env.equity - 500.0),
+        "return_pct": float((env.equity / 500.0 - 1) * 100),
+        "max_drawdown_pct": float(-info["drawdown"] * 100),
+        "actions": actions,
+    }
+    return result
 
-    train_env = Monitor(OptionsTradingEnv(train_data, initial_cash=500.0))
+
+def train(ticker: str, timesteps: int = DEFAULT_TIMESTEPS, period: str = "730d") -> Path:
+    data = load_hourly_data(ticker, period)
+    # Keep the final 145-day block completely untouched for the final test.
+    if len(data) <= EPISODE_HOURS + LOOKBACK + 100:
+        raise ValueError("Not enough hourly history for a 60-candle lookback and 145-day episodes")
+    split = len(data) - EPISODE_HOURS
+    train_data = data.iloc[:split].reset_index(drop=True)
+    test_data = data.iloc[split - LOOKBACK:].reset_index(drop=True)
+
+    train_env = Monitor(OptionsTradingEnv(
+        train_data,
+        initial_cash=500.0,
+        lookback=LOOKBACK,
+        episode_hours=EPISODE_HOURS,
+    ))
+    eval_env = Monitor(OptionsTradingEnv(
+        test_data,
+        initial_cash=500.0,
+        lookback=LOOKBACK,
+        episode_hours=EPISODE_HOURS,
+        fixed_start=LOOKBACK,
+    ))
+
+    out_dir = Path("models")
+    out_dir.mkdir(exist_ok=True)
+    eval_dir = Path("training_eval")
+    eval_dir.mkdir(exist_ok=True)
+    best_dir = out_dir / "best"
+    best_dir.mkdir(exist_ok=True)
+
+    callback = EvalCallback(
+        eval_env,
+        best_model_save_path=str(best_dir),
+        log_path=str(eval_dir),
+        eval_freq=50_000,
+        n_eval_episodes=1,
+        deterministic=True,
+        verbose=1,
+    )
+
     model = PPO(
         "MlpPolicy",
         train_env,
         learning_rate=3e-4,
-        n_steps=1024,
+        n_steps=2048,
         batch_size=256,
         gamma=0.995,
         gae_lambda=0.95,
@@ -62,35 +128,31 @@ def train(ticker: str, timesteps: int, period: str = "730d") -> Path:
         clip_range=0.2,
         verbose=1,
         seed=42,
+        device="auto",
     )
-    model.learn(total_timesteps=timesteps, progress_bar=True)
+    model.learn(total_timesteps=timesteps, callback=callback, progress_bar=True)
 
-    out_dir = Path("models")
-    out_dir.mkdir(exist_ok=True)
     path = out_dir / f"ppo_options_{ticker.lower()}"
     model.save(path)
+    result = evaluate(model, test_data, "final")
 
-    # Chronological out-of-sample evaluation, never used during training.
-    eval_env = OptionsTradingEnv(test_data, initial_cash=500.0)
-    obs, _ = eval_env.reset(seed=123)
-    terminated = False
-    while not terminated:
-        action, _ = model.predict(obs, deterministic=True)
-        obs, _, terminated, _, _ = eval_env.step(int(action))
+    print("\n=== 145-DAY OUT-OF-SAMPLE TEST ===")
     print(f"Ticker: {ticker}")
-    print(f"Training bars: {len(train_data):,}")
-    print(f"Test bars: {len(test_data):,}")
-    print(f"Initial capital: €500.00")
-    print(f"Out-of-sample equity: €{eval_env.equity:,.2f}")
-    print(f"Out-of-sample P&L: €{eval_env.equity - 500.0:,.2f}")
+    print(f"Lookback: {LOOKBACK} hourly candles")
+    print(f"Episode: {EPISODE_HOURS} hourly steps (~145 trading days)")
+    print("Initial capital: €500.00")
+    print(f"Final equity: €{result['final']:,.2f}")
+    print(f"P&L: €{result['pnl']:,.2f}")
+    print(f"Return: {result['return_pct']:.2f}%")
     print(f"Model saved: {path}.zip")
+    print(f"Best checkpoint: {best_dir / 'best_model.zip'}")
     return path
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Train the options trading RL agent on hourly candles.")
+    parser = argparse.ArgumentParser(description="Train the options RL agent on hourly candles.")
     parser.add_argument("--ticker", default="SPY")
-    parser.add_argument("--timesteps", type=int, default=200_000)
+    parser.add_argument("--timesteps", type=int, default=DEFAULT_TIMESTEPS)
     parser.add_argument("--period", default="730d")
     args = parser.parse_args()
     train(args.ticker.upper(), args.timesteps, args.period)
