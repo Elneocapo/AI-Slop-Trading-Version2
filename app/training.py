@@ -83,10 +83,12 @@ def train(
     resume: bool = False,
 ) -> Path:
     data = load_hourly_data(ticker, period)
-    # Keep the final 145-day block completely untouched for the final test.
+    # Reserve the final 145-day block plus one terminal candle for the
+    # untouched chronological test. The environment needs that terminal
+    # candle to build its final observation after the last step.
     if len(data) <= EPISODE_HOURS + LOOKBACK + 100:
         raise ValueError("Not enough hourly history for a 60-candle lookback and 145-day episodes")
-    split = len(data) - EPISODE_HOURS
+    split = len(data) - EPISODE_HOURS - 1
     train_data = data.iloc[:split].reset_index(drop=True)
     test_data = data.iloc[split - LOOKBACK:].reset_index(drop=True)
 
@@ -149,7 +151,12 @@ def train(
         )
         print(f"Starting new PPO model for {timesteps:,} timesteps.")
 
-    model.learn(total_timesteps=timesteps, callback=callback, progress_bar=True, reset_num_timesteps=not resume)
+    model.learn(
+        total_timesteps=timesteps,
+        callback=callback,
+        progress_bar=True,
+        reset_num_timesteps=not resume,
+    )
     model.save(path)
     result = evaluate(model, test_data, "final")
 
