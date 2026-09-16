@@ -4,8 +4,5 @@ Run from the repository root with:
     streamlit run app.py
 """
 
-from app.ui.dashboard import main
-
-
-if __name__ == "__main__":
-    main()
+# Importing the dashboard module starts the Streamlit UI.
+import app.ui.dashboard  # noqa: F401,E402
