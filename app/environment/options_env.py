@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from math import exp, log, sqrt
+from math import erf, exp, log, sqrt
 
 import gymnasium as gym
 import numpy as np
@@ -96,7 +96,7 @@ class OptionsTradingEnv(gym.Env):
 
     @staticmethod
     def _norm_cdf(x: float) -> float:
-        return 0.5 * (1.0 + np.math.erf(x / sqrt(2.0)))
+        return 0.5 * (1.0 + erf(x / sqrt(2.0)))
 
     def _option_price(self, spot: float, strike: float, tau_hours: float, vol: float, call: bool) -> float:
         if tau_hours <= 0:
