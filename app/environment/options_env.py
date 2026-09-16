@@ -71,18 +71,44 @@ class OptionsTradingEnv(gym.Env):
             "sma72_gap",
             "volatility_24h",
             "volume_z",
+            "volume_ratio_24h",
             "rsi_14",
             "atr_pct",
+            "time_sin",
+            "time_cos",
+            "weekday_sin",
+            "weekday_cos",
+            "is_regular_session",
+            "minutes_since_open",
+            "minutes_to_close",
+            "near_open",
+            "near_close",
+            "pre_market",
+            "after_hours",
+            "session_return",
+            "session_high_gap",
+            "session_low_gap",
+            "session_range_position",
+            "range_24h_position",
+            "high_24h_gap",
+            "low_24h_gap",
+            "bar_return",
+            "bar_range_pct",
+            "gap_from_prev_close",
         ]
         self.feature_cols = [c for c in feature_cols if c in self.data.columns]
         self.features = self.data[self.feature_cols].astype(float).replace([np.inf, -np.inf], np.nan).fillna(0.0).to_numpy()
         self.n_features = len(self.feature_cols) + 1
 
+        # 8 portfolio values + 8 current time/session values + 12 option
+        # values. The option values are theoretical candidate contracts at
+        # the current spot and are not derived from future prices.
+        self.context_size = 28
         self.action_space = spaces.Discrete(6)
         self.observation_space = spaces.Box(
             low=-np.inf,
             high=np.inf,
-            shape=(self.lookback * self.n_features + 8,),
+            shape=(self.lookback * self.n_features + self.context_size,),
             dtype=np.float32,
         )
 
@@ -98,6 +124,10 @@ class OptionsTradingEnv(gym.Env):
     def _norm_cdf(x: float) -> float:
         return 0.5 * (1.0 + erf(x / sqrt(2.0)))
 
+    @staticmethod
+    def _norm_pdf(x: float) -> float:
+        return exp(-0.5 * x * x) / sqrt(2.0 * np.pi)
+
     def _option_price(self, spot: float, strike: float, tau_hours: float, vol: float, call: bool) -> float:
         if tau_hours <= 0:
             return max(spot - strike, 0.0) if call else max(strike - spot, 0.0)
@@ -111,6 +141,33 @@ class OptionsTradingEnv(gym.Env):
             return spot * nd1 - strike * nd2
         return strike * (1.0 - nd2) - spot * (1.0 - nd1)
 
+    def _option_greeks(self, spot: float, strike: float, tau_hours: float, vol: float, call: bool) -> tuple[float, float, float, float, float]:
+        """Return price, delta, gamma, theta-per-hour and vega for a candidate option."""
+        if tau_hours <= 0:
+            intrinsic = max(spot - strike, 0.0) if call else max(strike - spot, 0.0)
+            delta = 1.0 if call and spot > strike else -1.0 if (not call and spot < strike) else 0.0
+            return intrinsic, delta, 0.0, 0.0, 0.0
+        tau = tau_hours / (24.0 * 252.0)
+        vol = max(float(vol), 0.15)
+        sqrt_tau = sqrt(tau)
+        d1 = (log(max(spot, 1e-9) / max(strike, 1e-9)) + 0.5 * vol * vol * tau) / (vol * sqrt_tau)
+        d2 = d1 - vol * sqrt_tau
+        price = self._option_price(spot, strike, tau_hours, vol, call)
+        pdf = self._norm_pdf(d1)
+        if call:
+            delta = self._norm_cdf(d1)
+        else:
+            delta = self._norm_cdf(d1) - 1.0
+        gamma = pdf / (max(spot, 1e-9) * vol * sqrt_tau)
+        theta_year = -(spot * pdf * vol) / (2.0 * sqrt_tau)
+        if call:
+            theta_year -= 0.0 * strike * self._norm_cdf(d2)
+        else:
+            theta_year += 0.0 * strike * self._norm_cdf(-d2)
+        theta_hour = theta_year / (24.0 * 252.0)
+        vega = spot * pdf * sqrt_tau
+        return price, delta, gamma, theta_hour, vega
+
     def _vol(self, t: int) -> float:
         if "volatility_24h" in self.data.columns:
             v = float(self.data.loc[t, "volatility_24h"])
@@ -123,14 +180,14 @@ class OptionsTradingEnv(gym.Env):
             return 0.0
         spot = float(self.prices[t])
         tau = max(self.position.expiry_t - t, 0)
-        call = self.position.kind == 1
+        call = self.position.kind in (1, 2)
         return self._option_price(spot, self.position.strike, tau, self._vol(t), call)
 
     def _open(self, kind: int):
         if self.position is not None:
             return
         spot = float(self.prices[self.t])
-        call = kind == 1
+        call = kind in (1, 2)
         strike = spot * (1.01 if call else 0.99)
         expiry_t = min(self.t + 120, self.end_t)
         price = self._option_price(spot, strike, expiry_t - self.t, self._vol(self.t), call)
@@ -185,10 +242,43 @@ class OptionsTradingEnv(gym.Env):
             close = self.prices[i]
             market.extend(self.features[i].tolist())
             market.append(float(self.highs[i] - self.lows[i]) / max(close, 1e-9))
+
         equity = self._equity(self.t)
         drawdown = max(0.0, (self.peak_equity - equity) / max(self.peak_equity, 1e-9))
         position_flag = 0.0 if self.position is None else float(self.position.kind)
         position_pnl = 0.0 if self.position is None else float((self._mark(self.t) - self.position.entry_price) * self.multiplier)
+
+        timestamp = self.data.loc[self.t, "timestamp"] if "timestamp" in self.data.columns else None
+        if timestamp is not None:
+            minutes = timestamp.hour * 60 + timestamp.minute
+            session_open = 9 * 60 + 30
+            session_close = 16 * 60
+            session_elapsed = np.clip(minutes - session_open, 0, 390) / 390.0
+            time_to_close = np.clip(session_close - minutes, 0, 390) / 390.0
+            time_sin = float(np.sin(2 * np.pi * minutes / (24 * 60)))
+            time_cos = float(np.cos(2 * np.pi * minutes / (24 * 60)))
+            regular = 1.0 if session_open <= minutes <= session_close else 0.0
+            near_open = 1.0 if session_open <= minutes < session_open + 30 else 0.0
+            near_close = 1.0 if session_close - 30 <= minutes <= session_close else 0.0
+        else:
+            session_elapsed = 0.0
+            time_to_close = 0.0
+            time_sin = time_cos = 0.0
+            regular = near_open = near_close = 0.0
+
+        spot = float(self.prices[self.t])
+        vol = self._vol(self.t)
+        call_strike = spot * 1.01
+        put_strike = spot * 0.99
+        call = self._option_greeks(spot, call_strike, 120, vol, True)
+        put = self._option_greeks(spot, put_strike, 120, vol, False)
+
+        position_time_left = 0.0
+        position_moneyness = 0.0
+        if self.position is not None:
+            position_time_left = max(self.position.expiry_t - self.t, 0) / 120.0
+            position_moneyness = self.position.strike / max(spot, 1e-9) - 1.0
+
         portfolio = [
             self.cash / self.initial_cash,
             equity / self.initial_cash,
@@ -199,7 +289,31 @@ class OptionsTradingEnv(gym.Env):
             float(self.t - start) / max(self.episode_hours, 1),
             1.0,
         ]
-        return np.asarray(market + portfolio, dtype=np.float32)
+        current_context = [
+            session_elapsed,
+            time_to_close,
+            time_sin,
+            time_cos,
+            regular,
+            near_open,
+            near_close,
+            position_time_left,
+        ]
+        option_context = [
+            call[0] / max(spot, 1e-9),
+            call[1],
+            call[2] * spot,
+            call[3] / max(spot, 1e-9),
+            call[4] / max(spot, 1e-9),
+            put[0] / max(spot, 1e-9),
+            put[1],
+            put[2] * spot,
+            put[3] / max(spot, 1e-9),
+            put[4] / max(spot, 1e-9),
+            vol,
+            position_moneyness,
+        ]
+        return np.asarray(market + portfolio + current_context + option_context, dtype=np.float32)
 
     def _equity(self, t: int) -> float:
         if self.position is None:
