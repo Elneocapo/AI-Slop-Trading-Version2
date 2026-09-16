@@ -2,11 +2,13 @@
 
 > **PAPER TRADING ONLY.** This repository does not place real-money orders. It is a research/education project and makes no promise of profitability.
 
-BrokerIA is a modular Python application for quantitative options research, backtesting and paper trading. The architecture deliberately keeps the strategy separate from the risk manager and broker adapter.
+BrokerIA is a modular Python desktop application for quantitative options research, backtesting and paper trading. The strategy remains separate from the risk manager and broker adapter.
 
 ## Architecture
 
 `Market Data → Analysis → ML → Strategy → Risk Manager → Paper Broker → Monitor → Database`
+
+The desktop interface is built with Python/Tkinter and calls the existing application modules directly. Slow market-data/model work runs in a background thread so the interface stays responsive.
 
 The LLM layer, if added later, is auxiliary: it may summarize news or explain model output, but it must not directly decide or bypass quantitative risk controls.
 
@@ -28,17 +30,13 @@ python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 pip install -r requirements.txt
 Copy-Item .env.example .env
-python run.py --once
+python app.py
 ```
 
-### Windows CMD
+Or explicitly:
 
-```cmd
-python -m venv .venv
-.venv\Scripts\activate
-pip install -r requirements.txt
-copy .env.example .env
-python run.py --once
+```powershell
+python run_gui.py
 ```
 
 ### Linux/macOS
@@ -48,13 +46,7 @@ python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
 cp .env.example .env
-python run.py --once
-```
-
-Dashboard:
-
-```bash
-streamlit run app/ui/dashboard.py
+python app.py
 ```
 
 Tests:
@@ -63,9 +55,19 @@ Tests:
 pytest
 ```
 
-## Configuration
+The legacy Streamlit dashboard is no longer the primary interface. The desktop app is the supported UI.
 
-Copy `.env.example` to `.env`. The default configuration uses simulation and does not require broker credentials. Alpaca credentials are only needed when using the paper broker adapter.
+## Desktop UI
+
+The application provides:
+
+- ticker and historical-period selection;
+- non-blocking **Run analysis** execution;
+- current price, model probability and signal display;
+- quantitative reasoning output;
+- an embedded price-history chart;
+- a run log and visible error reporting;
+- paper-trading safety status.
 
 ## Current scope
 
@@ -78,6 +80,6 @@ Copy `.env.example` to `.env`. The default configuration uses simulation and doe
 7. Hard risk gate.
 8. Paper broker adapter.
 9. SQLite persistence and structured logging.
-10. Streamlit dashboard.
+10. Tkinter desktop interface.
 
 Historical options-chain availability varies by provider; the project does not pretend that current option chains are equivalent to a complete historical options database.
