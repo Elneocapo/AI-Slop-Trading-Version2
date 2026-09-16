@@ -14,7 +14,7 @@ on:
 jobs:
   train:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 360
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -28,11 +28,14 @@ jobs:
         run: python -m pip install --upgrade pip && pip install -r requirements-rl.txt
 
       - name: Train PPO agent
-        run: python train_ai.py --ticker SPY --timesteps 200000
+        run: python train_ai.py --ticker SPY --timesteps 5000000
 
-      - name: Upload trained model
+      - name: Upload trained model and evaluation logs
         uses: actions/upload-artifact@v4
         with:
           name: ppo-options-spy
-          path: models/ppo_options_spy.zip
+          path: |
+            models/ppo_options_spy.zip
+            models/best/best_model.zip
+            training_eval/
           if-no-files-found: error
