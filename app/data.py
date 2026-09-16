@@ -16,6 +16,11 @@ def get_historical_prices(ticker: str, period: str = "2y", interval: str = "1d")
     return data[required].dropna().copy()
 
 
+def get_historical_hourly_prices(ticker: str, period: str = "730d") -> pd.DataFrame:
+    """Return hourly OHLCV data used by the RL training environment."""
+    return get_historical_prices(ticker, period=period, interval="1h")
+
+
 def get_stock_quote(ticker: str) -> dict:
     quote = yf.Ticker(ticker).fast_info
     return {
