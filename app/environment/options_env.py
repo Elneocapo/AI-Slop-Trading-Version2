@@ -64,7 +64,6 @@ class OptionsTradingEnv(gym.Env):
         self.fixed_start = fixed_start
 
         self.action_space = spaces.Discrete(6)
-        # 60 candles x 10 normalized market features + 8 portfolio features.
         self.observation_space = spaces.Box(-10.0, 10.0, shape=(608,), dtype=np.float32)
         self.t = self.lookback
         self.end_t = self.t + self.episode_hours
@@ -118,7 +117,6 @@ class OptionsTradingEnv(gym.Env):
         mark = self._position_mark() * self.position.contracts * self.multiplier
         if self.position.kind in (1, -1):
             return self.cash + mark
-        # For shorts, collateral remains reserved in cash and the liability is mark.
         return self.cash - mark + self.position.collateral
 
     def _observation(self) -> np.ndarray:
@@ -165,12 +163,13 @@ class OptionsTradingEnv(gym.Env):
             position_kind = 1 if is_call else -1
             self.position = OptionPosition(position_kind, strike, expiry, 1, premium)
         else:
-            # Simulated margin prevents unlimited leverage from €500 capital.
             collateral = spot * self.multiplier * 0.50
             total = collateral + self.transaction_cost
             if total > self.cash:
                 return
+            # Seller receives the option premium immediately, while collateral is reserved.
             self.cash -= total
+            self.cash += notional
             position_kind = 2 if is_call else -2
             self.position = OptionPosition(position_kind, strike, expiry, 1, premium, collateral)
 
