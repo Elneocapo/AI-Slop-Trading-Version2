@@ -21,11 +21,19 @@ MAX_TRADE_RISK_PCT = 0.10
 
 
 class RiskManagedOptionsEnv(gym.ActionWrapper):
-    """Cap each new position at 10% of current account equity."""
+    """Apply hard risk controls before an action reaches the trading environment."""
 
     def __init__(self, env: OptionsTradingEnv, max_trade_risk_pct: float = MAX_TRADE_RISK_PCT):
         super().__init__(env)
         self.max_trade_risk_pct = float(max_trade_risk_pct)
+
+    @property
+    def trade_log(self):
+        return self.env.trade_log
+
+    @property
+    def equity(self):
+        return self.env.equity
 
     def action(self, action):
         action = np.asarray(action, dtype=np.int64).reshape(-1).copy()
@@ -33,7 +41,15 @@ class RiskManagedOptionsEnv(gym.ActionWrapper):
             return action
 
         operation, option_type, strike_idx, dte_idx, size_idx = [int(x) for x in action]
+
+        # HOLD and CLOSE pass through unchanged. Only a new position is risk-checked.
         if operation not in (1, 2) or self.env.position is not None:
+            return action
+
+        # Naked short options are disabled for now. A 10% risk budget cannot honestly
+        # cap their maximum loss; defined-risk spreads can be added later.
+        if operation == 2:
+            action[0] = 0
             return action
 
         from app.environment.options_env import CALL, CONTRACT_SIZES, DTE_DAYS, STRIKE_OFFSETS
@@ -55,21 +71,14 @@ class RiskManagedOptionsEnv(gym.ActionWrapper):
             self.env._vol(self.env.t),
             call,
         )
-        execution_price = (
-            theoretical * (1.0 + self.env.slippage)
-            if operation == 1
-            else theoretical * max(1.0 - self.env.slippage, 0.0)
-        )
+        execution_price = theoretical * (1.0 + self.env.slippage)
 
+        # Long-option maximum loss is the premium paid plus transaction cost.
+        # Clamp the requested size to the largest size that fits BOTH the risk budget
+        # and available cash. If even one contract does not fit, reject the action.
         allowed_size_idx = None
         for candidate_idx, contracts in enumerate(CONTRACT_SIZES):
-            if operation == 1:
-                required = execution_price * self.env.multiplier * contracts + self.env.transaction_cost
-            else:
-                collateral = spot * self.env.multiplier * contracts * 0.50
-                premium = execution_price * self.env.multiplier * contracts
-                required = collateral - premium + self.env.transaction_cost
-
+            required = execution_price * self.env.multiplier * contracts + self.env.transaction_cost
             if required <= risk_budget and required <= float(self.env.cash):
                 allowed_size_idx = candidate_idx
 
@@ -276,7 +285,7 @@ def train(
             batch_size=256,
             gamma=0.995,
             gae_lambda=0.95,
-            ent_coef=0.01,
+            ent_coef=0.05,
             clip_range=0.2,
             verbose=1,
             seed=42,
