@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
+import gymnasium as gym
 import numpy as np
 import pandas as pd
 import yfinance as yf
@@ -16,6 +17,67 @@ from app.environment.options_env import OptionsTradingEnv
 EPISODE_HOURS = 145 * 7
 LOOKBACK = 60
 DEFAULT_TIMESTEPS = 5_000_000
+MAX_TRADE_RISK_PCT = 0.10
+
+
+class RiskManagedOptionsEnv(gym.ActionWrapper):
+    """Cap each new position at 10% of current account equity."""
+
+    def __init__(self, env: OptionsTradingEnv, max_trade_risk_pct: float = MAX_TRADE_RISK_PCT):
+        super().__init__(env)
+        self.max_trade_risk_pct = float(max_trade_risk_pct)
+
+    def action(self, action):
+        action = np.asarray(action, dtype=np.int64).reshape(-1).copy()
+        if len(action) != 5:
+            return action
+
+        operation, option_type, strike_idx, dte_idx, size_idx = [int(x) for x in action]
+        if operation not in (1, 2) or self.env.position is not None:
+            return action
+
+        from app.environment.options_env import CALL, CONTRACT_SIZES, DTE_DAYS, STRIKE_OFFSETS
+
+        equity = max(float(self.env._equity(self.env.t)), 0.0)
+        risk_budget = equity * self.max_trade_risk_pct
+        if risk_budget <= self.env.transaction_cost:
+            action[0] = 0
+            return action
+
+        spot = float(self.env.prices[self.env.t])
+        strike = max(spot * (1.0 + STRIKE_OFFSETS[strike_idx]), 0.01)
+        expiry_t = min(self.env.t + DTE_DAYS[dte_idx] * 7, self.env.end_t)
+        call = option_type == CALL
+        theoretical = self.env._option_price(
+            spot,
+            strike,
+            expiry_t - self.env.t,
+            self.env._vol(self.env.t),
+            call,
+        )
+        execution_price = (
+            theoretical * (1.0 + self.env.slippage)
+            if operation == 1
+            else theoretical * max(1.0 - self.env.slippage, 0.0)
+        )
+
+        allowed_size_idx = None
+        for candidate_idx, contracts in enumerate(CONTRACT_SIZES):
+            if operation == 1:
+                required = execution_price * self.env.multiplier * contracts + self.env.transaction_cost
+            else:
+                collateral = spot * self.env.multiplier * contracts * 0.50
+                premium = execution_price * self.env.multiplier * contracts
+                required = collateral - premium + self.env.transaction_cost
+
+            if required <= risk_budget and required <= float(self.env.cash):
+                allowed_size_idx = candidate_idx
+
+        if allowed_size_idx is None:
+            action[0] = 0
+        else:
+            action[4] = allowed_size_idx
+        return action
 
 
 def load_hourly_data(ticker: str, period: str = "730d") -> pd.DataFrame:
@@ -108,13 +170,13 @@ def load_hourly_data(ticker: str, period: str = "730d") -> pd.DataFrame:
 
 
 def evaluate(model: PPO, data: pd.DataFrame, label: str) -> dict:
-    env = OptionsTradingEnv(
+    env = RiskManagedOptionsEnv(OptionsTradingEnv(
         data,
         initial_cash=500.0,
         lookback=LOOKBACK,
         episode_hours=EPISODE_HOURS,
         fixed_start=LOOKBACK,
-    )
+    ))
     obs, _ = env.reset(seed=123)
     terminated = False
     actions = []
@@ -130,8 +192,8 @@ def evaluate(model: PPO, data: pd.DataFrame, label: str) -> dict:
     losses = [t for t in closed_trades if t["pnl"] < 0]
     long_trades = [t for t in closed_trades if t["kind"] in (1, -1)]
     short_trades = [t for t in closed_trades if t["kind"] in (2, -2)]
-    call_trades = [t for t in closed_trades if abs(t["kind"]) in (1, 2)]
-    put_trades = [t for t in closed_trades if abs(t["kind"]) in (-1, -2)]
+    call_trades = [t for t in closed_trades if t["kind"] in (1, 2)]
+    put_trades = [t for t in closed_trades if t["kind"] in (-1, -2)]
 
     result = {
         "label": label,
@@ -170,13 +232,13 @@ def train(
     train_data = data.iloc[:split].reset_index(drop=True)
     test_data = data.iloc[split - LOOKBACK:].reset_index(drop=True)
 
-    train_env = Monitor(OptionsTradingEnv(
+    train_env = Monitor(RiskManagedOptionsEnv(OptionsTradingEnv(
         train_data, initial_cash=500.0, lookback=LOOKBACK, episode_hours=EPISODE_HOURS
-    ))
-    eval_env = Monitor(OptionsTradingEnv(
+    )))
+    eval_env = Monitor(RiskManagedOptionsEnv(OptionsTradingEnv(
         test_data, initial_cash=500.0, lookback=LOOKBACK,
         episode_hours=EPISODE_HOURS, fixed_start=LOOKBACK
-    ))
+    )))
 
     out_dir = Path("models")
     out_dir.mkdir(exist_ok=True)
@@ -247,6 +309,7 @@ def train(
     print(f"Best trade P&L: €{result['best_trade']:,.2f}")
     print(f"Worst trade P&L: €{result['worst_trade']:,.2f}")
     print(f"Sum of trade P&L: €{result['total_trade_pnl']:,.2f}")
+    print(f"Risk limit: {MAX_TRADE_RISK_PCT * 100:.0f}% of current equity per new position")
     if result["trades"]:
         print("\nTrade log:")
         for i, trade in enumerate(result["trades"], 1):
