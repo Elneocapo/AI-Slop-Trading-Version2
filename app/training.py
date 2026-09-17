@@ -81,9 +81,6 @@ def load_hourly_data(ticker: str, period: str = "730d") -> pd.DataFrame:
     df["pre_market"] = (minutes_of_day < session_open_min).astype(float)
     df["after_hours"] = (minutes_of_day > session_close_min).astype(float)
 
-    # These session features must never reveal the regular-session open/high/low
-    # during pre-market bars. Only information already available at each bar is
-    # exposed to the policy.
     local_date = timestamps.date
     regular_open = open_.where(regular).groupby(local_date).transform("first")
     session_high = high.where(regular).groupby(local_date).cummax()
@@ -126,6 +123,16 @@ def evaluate(model: PPO, data: pd.DataFrame, label: str) -> dict:
         action = np.asarray(action, dtype=np.int64).reshape(-1)
         actions.append(action.tolist())
         obs, _, terminated, _, info = env.step(action)
+
+    trades = list(env.trade_log)
+    closed_trades = [t for t in trades if t.get("reason") in {"close", "expiry"}]
+    wins = [t for t in closed_trades if t["pnl"] > 0]
+    losses = [t for t in closed_trades if t["pnl"] < 0]
+    long_trades = [t for t in closed_trades if t["kind"] in (1, -1)]
+    short_trades = [t for t in closed_trades if t["kind"] in (2, -2)]
+    call_trades = [t for t in closed_trades if abs(t["kind"]) in (1, 2)]
+    put_trades = [t for t in closed_trades if abs(t["kind"]) in (-1, -2)]
+
     result = {
         "label": label,
         "initial": 500.0,
@@ -134,6 +141,18 @@ def evaluate(model: PPO, data: pd.DataFrame, label: str) -> dict:
         "return_pct": float((env.equity / 500.0 - 1) * 100),
         "max_drawdown_pct": float(-info["drawdown"] * 100),
         "actions": actions,
+        "trades": closed_trades,
+        "trade_count": len(closed_trades),
+        "win_count": len(wins),
+        "loss_count": len(losses),
+        "win_rate_pct": (len(wins) / len(closed_trades) * 100) if closed_trades else 0.0,
+        "long_count": len(long_trades),
+        "short_count": len(short_trades),
+        "call_count": len(call_trades),
+        "put_count": len(put_trades),
+        "total_trade_pnl": float(sum(t["pnl"] for t in closed_trades)),
+        "best_trade": float(max((t["pnl"] for t in closed_trades), default=0.0)),
+        "worst_trade": float(min((t["pnl"] for t in closed_trades), default=0.0)),
     }
     return result
 
@@ -220,6 +239,25 @@ def train(
     print(f"Final equity: €{result['final']:,.2f}")
     print(f"P&L: €{result['pnl']:,.2f}")
     print(f"Return: {result['return_pct']:.2f}%")
+    print(f"Max drawdown: {result['max_drawdown_pct']:.2f}%")
+    print(f"Closed trades: {result['trade_count']}")
+    print(f"Win rate: {result['win_rate_pct']:.2f}% ({result['win_count']}W / {result['loss_count']}L)")
+    print(f"Long trades: {result['long_count']} | Short trades: {result['short_count']}")
+    print(f"Calls: {result['call_count']} | Puts: {result['put_count']}")
+    print(f"Best trade P&L: €{result['best_trade']:,.2f}")
+    print(f"Worst trade P&L: €{result['worst_trade']:,.2f}")
+    print(f"Sum of trade P&L: €{result['total_trade_pnl']:,.2f}")
+    if result["trades"]:
+        print("\nTrade log:")
+        for i, trade in enumerate(result["trades"], 1):
+            kind_name = {1: "LONG CALL", -1: "LONG PUT", 2: "SHORT CALL", -2: "SHORT PUT"}.get(trade["kind"], str(trade["kind"]))
+            print(
+                f"#{i:02d} {kind_name} | contracts={trade['contracts']} | "
+                f"strike={trade['strike']:.2f} | entry={trade['entry_price']:.4f} | "
+                f"exit={trade['exit_price']:.4f} | pnl=€{trade['pnl']:,.2f} | {trade['reason']}"
+            )
+    else:
+        print("No closed trades recorded in the out-of-sample test.")
     print(f"Model saved: {path}.zip")
     print(f"Best checkpoint: {best_dir / 'best_model.zip'}")
     return path
