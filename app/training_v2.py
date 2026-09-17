@@ -1,0 +1,290 @@
+from __future__ import annotations
+
+import argparse
+from pathlib import Path
+
+import gymnasium as gym
+import numpy as np
+import pandas as pd
+import yfinance as yf
+from stable_baselines3 import PPO
+from stable_baselines3.common.callbacks import EvalCallback
+from stable_baselines3.common.monitor import Monitor
+
+from app.environment.options_env import CALL, CONTRACT_SIZES, DTE_DAYS, STRIKE_OFFSETS, OptionsTradingEnv
+
+EPISODE_HOURS = 145 * 7
+LOOKBACK = 60
+DEFAULT_TIMESTEPS = 5_000_000
+MAX_TRADE_RISK_PCT = 0.10
+INVALID_ACTION_PENALTY = 0.0005
+
+
+class RiskManagedPPOEnv(gym.Wrapper):
+    """Expose a compact joint action space and enforce hard account risk."""
+
+    # 0 HOLD, 1 OPEN_LONG, 2 CLOSE. For OPEN_LONG the agent chooses type/strike/DTE;
+    # contract count is selected by the risk manager so an impossible size cannot be learned.
+    ACTION_COUNT = 3 * 2 * len(STRIKE_OFFSETS) * len(DTE_DAYS)
+
+    def __init__(self, env: OptionsTradingEnv, max_trade_risk_pct: float = MAX_TRADE_RISK_PCT):
+        super().__init__(env)
+        self.action_space = gym.spaces.Discrete(self.ACTION_COUNT)
+        self.max_trade_risk_pct = float(max_trade_risk_pct)
+        self.last_rejected = False
+
+    @property
+    def trade_log(self):
+        return self.env.trade_log
+
+    @property
+    def equity(self):
+        return self.env.equity
+
+    def _decode(self, action: int):
+        action = int(np.asarray(action).item())
+        per_operation = 2 * len(STRIKE_OFFSETS) * len(DTE_DAYS)
+        operation = action // per_operation
+        rem = action % per_operation
+        option_type = rem // (len(STRIKE_OFFSETS) * len(DTE_DAYS))
+        rem %= len(STRIKE_OFFSETS) * len(DTE_DAYS)
+        strike_idx = rem // len(DTE_DAYS)
+        dte_idx = rem % len(DTE_DAYS)
+        return operation, option_type, strike_idx, dte_idx
+
+    def _cheapest_affordable(self, option_type: int, risk_budget: float):
+        spot = float(self.env.prices[self.env.t])
+        vol = self.env._vol(self.env.t)
+        best = None
+        for strike_idx, offset in enumerate(STRIKE_OFFSETS):
+            strike = max(spot * (1.0 + offset), 0.01)
+            for dte_idx, dte_days in enumerate(DTE_DAYS):
+                expiry_t = min(self.env.t + dte_days * 7, self.env.end_t)
+                theoretical = self.env._option_price(
+                    spot, strike, expiry_t - self.env.t, vol, option_type == CALL
+                )
+                execution_price = theoretical * (1.0 + self.env.slippage)
+                required = execution_price * self.env.multiplier + self.env.transaction_cost
+                if required <= risk_budget and required <= float(self.env.cash):
+                    if best is None or required < best[0]:
+                        best = (required, strike_idx, dte_idx)
+        return best
+
+    def _translate(self, action):
+        operation, option_type, strike_idx, dte_idx = self._decode(action)
+        self.last_rejected = False
+
+        if operation == 0:
+            return np.array([0, option_type, strike_idx, dte_idx, 0], dtype=np.int64)
+        if operation == 2:
+            return np.array([3, option_type, strike_idx, dte_idx, 0], dtype=np.int64)
+
+        if self.env.position is not None:
+            self.last_rejected = True
+            return np.array([0, option_type, strike_idx, dte_idx, 0], dtype=np.int64)
+
+        equity = max(float(self.env._equity(self.env.t)), 0.0)
+        risk_budget = equity * self.max_trade_risk_pct
+        if risk_budget <= self.env.transaction_cost:
+            self.last_rejected = True
+            return np.array([0, option_type, strike_idx, dte_idx, 0], dtype=np.int64)
+
+        # First honor the model's selected contract. If it is too expensive, select the
+        # cheapest contract of the same option type that still satisfies the hard limit.
+        spot = float(self.env.prices[self.env.t])
+        strike = max(spot * (1.0 + STRIKE_OFFSETS[strike_idx]), 0.01)
+        expiry_t = min(self.env.t + DTE_DAYS[dte_idx] * 7, self.env.end_t)
+        theoretical = self.env._option_price(
+            spot, strike, expiry_t - self.env.t, self.env._vol(self.env.t), option_type == CALL
+        )
+        execution_price = theoretical * (1.0 + self.env.slippage)
+
+        allowed_size_idx = None
+        for idx, contracts in enumerate(CONTRACT_SIZES):
+            required = execution_price * self.env.multiplier * contracts + self.env.transaction_cost
+            if required <= risk_budget and required <= float(self.env.cash):
+                allowed_size_idx = idx
+
+        if allowed_size_idx is None:
+            fallback = self._cheapest_affordable(option_type, risk_budget)
+            if fallback is None:
+                self.last_rejected = True
+                return np.array([0, option_type, strike_idx, dte_idx, 0], dtype=np.int64)
+            _, strike_idx, dte_idx = fallback
+            allowed_size_idx = 0
+
+        return np.array([1, option_type, strike_idx, dte_idx, allowed_size_idx], dtype=np.int64)
+
+    def step(self, action):
+        translated = self._translate(action)
+        obs, reward, terminated, truncated, info = self.env.step(translated)
+        if self.last_rejected:
+            reward -= INVALID_ACTION_PENALTY
+        info = dict(info)
+        info["risk_rejected"] = bool(self.last_rejected)
+        info["decoded_action"] = self._decode(action)
+        return obs, float(reward), terminated, truncated, info
+
+
+def load_hourly_data(ticker: str, period: str = "730d") -> pd.DataFrame:
+    df = yf.download(ticker, period=period, interval="1h", auto_adjust=True, progress=False)
+    if df.empty:
+        raise ValueError(f"No hourly data returned for {ticker}")
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = df.columns.get_level_values(0)
+    df = df[["Open", "High", "Low", "Close", "Volume"]].dropna().copy()
+    timestamps = pd.DatetimeIndex(df.index)
+    if timestamps.tz is None:
+        timestamps = timestamps.tz_localize("America/New_York")
+    else:
+        timestamps = timestamps.tz_convert("America/New_York")
+    df["timestamp"] = timestamps
+
+    close = df["Close"].astype(float)
+    open_ = df["Open"].astype(float)
+    high = df["High"].astype(float)
+    low = df["Low"].astype(float)
+    volume = df["Volume"].astype(float)
+    df["return_1h"] = close.pct_change()
+    df["return_6h"] = close.pct_change(6)
+    df["return_24h"] = close.pct_change(24)
+    df["sma24_gap"] = close / close.rolling(24).mean() - 1
+    df["sma72_gap"] = close / close.rolling(72).mean() - 1
+    df["volatility_24h"] = df["return_1h"].rolling(24).std() * np.sqrt(24 * 252)
+    vm = volume.rolling(48).mean()
+    vs = volume.rolling(48).std().replace(0, np.nan)
+    df["volume_z"] = (volume - vm) / vs
+    df["volume_ratio_24h"] = volume / volume.rolling(24).mean().replace(0, np.nan)
+    delta = close.diff()
+    gain = delta.clip(lower=0).rolling(14).mean()
+    loss = -delta.clip(upper=0).rolling(14).mean()
+    rs = gain / loss.replace(0, np.nan)
+    df["rsi_14"] = 100 - 100 / (1 + rs)
+    tr = pd.concat([high - low, (high - close.shift()).abs(), (low - close.shift()).abs()], axis=1).max(axis=1)
+    df["atr_pct"] = tr.rolling(14).mean() / close
+
+    minutes = timestamps.hour * 60 + timestamps.minute
+    frac = minutes / (24 * 60)
+    df["time_sin"] = np.sin(2 * np.pi * frac)
+    df["time_cos"] = np.cos(2 * np.pi * frac)
+    df["weekday_sin"] = np.sin(2 * np.pi * timestamps.dayofweek / 7)
+    df["weekday_cos"] = np.cos(2 * np.pi * timestamps.dayofweek / 7)
+    open_min, close_min = 570, 960
+    session_minutes = minutes - open_min
+    regular = (session_minutes >= 0) & (session_minutes <= 390)
+    df["is_regular_session"] = regular.astype(float)
+    df["minutes_since_open"] = np.clip(session_minutes, 0, 390) / 390.0
+    df["minutes_to_close"] = np.clip(close_min - minutes, 0, 390) / 390.0
+    df["near_open"] = ((minutes >= open_min) & (minutes < open_min + 30)).astype(float)
+    df["near_close"] = ((minutes >= close_min - 30) & (minutes <= close_min)).astype(float)
+    df["pre_market"] = (minutes < open_min).astype(float)
+    df["after_hours"] = (minutes > close_min).astype(float)
+
+    # Only information available up to each bar is used. The opening value for a
+    # regular session is forward-filled after it actually occurs, never backwards.
+    local_date = pd.Series(timestamps.date, index=df.index)
+    regular_open = open_.where(regular).groupby(local_date).transform("first")
+    df["session_return"] = (close / regular_open - 1).where(regular, 0.0)
+    session_high = high.where(regular).groupby(local_date).cummax()
+    session_low = low.where(regular).groupby(local_date).cummin()
+    df["session_high_gap"] = (close / session_high - 1).where(regular, 0.0)
+    df["session_low_gap"] = (close / session_low - 1).where(regular, 0.0)
+    rng = (session_high - session_low).replace(0, np.nan)
+    df["session_range_position"] = ((close - session_low) / rng).where(regular, 0.0)
+    rh, rl = high.rolling(24).max(), low.rolling(24).min()
+    rr = (rh - rl).replace(0, np.nan)
+    df["range_24h_position"] = (close - rl) / rr
+    df["high_24h_gap"] = close / rh - 1
+    df["low_24h_gap"] = close / rl - 1
+    df["bar_return"] = close / open_ - 1
+    df["bar_range_pct"] = (high - low) / close.replace(0, np.nan)
+    daily_close = close.groupby(local_date).last()
+    prev = local_date.map(daily_close.shift(1))
+    df["gap_from_prev_close"] = open_ / prev - 1
+    return df.dropna().reset_index(drop=True)
+
+
+def evaluate(model, data: pd.DataFrame) -> dict:
+    env = RiskManagedPPOEnv(OptionsTradingEnv(data, initial_cash=500.0, lookback=LOOKBACK, episode_hours=EPISODE_HOURS, fixed_start=LOOKBACK))
+    obs, _ = env.reset(seed=123)
+    terminated = False
+    actions = []
+    info = {"drawdown": 0.0}
+    while not terminated:
+        action, _ = model.predict(obs, deterministic=True)
+        action = int(np.asarray(action).item())
+        actions.append(action)
+        obs, _, terminated, _, info = env.step(action)
+    trades = list(env.trade_log)
+    wins = [t for t in trades if t["pnl"] > 0]
+    losses = [t for t in trades if t["pnl"] < 0]
+    return {
+        "final": float(env.equity), "pnl": float(env.equity - 500.0),
+        "return_pct": float((env.equity / 500.0 - 1) * 100),
+        "max_drawdown_pct": float(-info["drawdown"] * 100),
+        "trades": trades, "actions": actions, "trade_count": len(trades),
+        "win_count": len(wins), "loss_count": len(losses),
+        "win_rate_pct": len(wins) / len(trades) * 100 if trades else 0.0,
+        "long_count": sum(t["kind"] in (1, -1) for t in trades),
+        "short_count": sum(t["kind"] in (2, -2) for t in trades),
+        "call_count": sum(t["kind"] in (1, 2) for t in trades),
+        "put_count": sum(t["kind"] in (-1, -2) for t in trades),
+        "total_trade_pnl": float(sum(t["pnl"] for t in trades)),
+        "best_trade": float(max((t["pnl"] for t in trades), default=0.0)),
+        "worst_trade": float(min((t["pnl"] for t in trades), default=0.0)),
+    }
+
+
+def train(ticker: str, timesteps: int = DEFAULT_TIMESTEPS, period: str = "730d", resume: bool = False) -> Path:
+    data = load_hourly_data(ticker, period)
+    if len(data) <= EPISODE_HOURS + LOOKBACK + 100:
+        raise ValueError("Not enough hourly history for training")
+    split = len(data) - EPISODE_HOURS - 1
+    train_data = data.iloc[:split].reset_index(drop=True)
+    test_data = data.iloc[split - LOOKBACK:].reset_index(drop=True)
+
+    train_env = Monitor(RiskManagedPPOEnv(OptionsTradingEnv(train_data, initial_cash=500.0, lookback=LOOKBACK, episode_hours=EPISODE_HOURS)))
+    eval_env = Monitor(RiskManagedPPOEnv(OptionsTradingEnv(test_data, initial_cash=500.0, lookback=LOOKBACK, episode_hours=EPISODE_HOURS, fixed_start=LOOKBACK)))
+    out = Path("models"); out.mkdir(exist_ok=True)
+    logs = Path("training_eval"); logs.mkdir(exist_ok=True)
+    best = out / "best"; best.mkdir(exist_ok=True)
+    path = out / f"ppo_options_{ticker.lower()}"
+    callback = EvalCallback(eval_env, best_model_save_path=str(best), log_path=str(logs), eval_freq=50_000, n_eval_episodes=1, deterministic=True, verbose=1)
+
+    # Old checkpoints used the 5-dimensional MultiDiscrete action space and are
+    # intentionally not resumable with this new 324-action policy.
+    if resume:
+        raise ValueError("--resume is disabled for the new joint Discrete action space. Start a fresh model.")
+    model = PPO("MlpPolicy", train_env, learning_rate=3e-4, n_steps=2048, batch_size=256,
+                gamma=0.995, gae_lambda=0.95, ent_coef=0.05, clip_range=0.2,
+                verbose=1, seed=42, device="auto")
+    print(f"Starting NEW joint-action PPO model for {timesteps:,} timesteps.")
+    model.learn(total_timesteps=timesteps, callback=callback, progress_bar=True)
+    model.save(path)
+    r = evaluate(model, test_data)
+    print("\n=== 145-DAY OUT-OF-SAMPLE TEST ===")
+    print(f"Ticker: {ticker}\nLookback: {LOOKBACK} hourly candles\nEpisode: {EPISODE_HOURS} hourly steps (~145 trading days)")
+    print("Initial capital: €500.00")
+    print(f"Final equity: €{r['final']:,.2f}\nP&L: €{r['pnl']:,.2f}\nReturn: {r['return_pct']:.2f}%\nMax drawdown: {r['max_drawdown_pct']:.2f}%")
+    print(f"Closed trades: {r['trade_count']}\nWin rate: {r['win_rate_pct']:.2f}% ({r['win_count']}W / {r['loss_count']}L)")
+    print(f"Long trades: {r['long_count']} | Short trades: {r['short_count']}\nCalls: {r['call_count']} | Puts: {r['put_count']}")
+    print(f"Best trade P&L: €{r['best_trade']:,.2f}\nWorst trade P&L: €{r['worst_trade']:,.2f}\nSum of trade P&L: €{r['total_trade_pnl']:,.2f}")
+    print(f"Risk limit: {MAX_TRADE_RISK_PCT * 100:.0f}% of current equity per new position")
+    print("No closed trades recorded in the out-of-sample test." if not r["trades"] else "Trade log recorded.")
+    print(f"Model saved: {path}.zip")
+    print(f"Best checkpoint: {best / 'best_model.zip'}")
+    return path
+
+
+def main():
+    p = argparse.ArgumentParser(description="Train the NVDA hourly options RL agent.")
+    p.add_argument("--ticker", default="NVDA")
+    p.add_argument("--timesteps", type=int, default=DEFAULT_TIMESTEPS)
+    p.add_argument("--period", default="730d")
+    p.add_argument("--resume", action="store_true")
+    a = p.parse_args()
+    train(a.ticker.upper(), a.timesteps, a.period, a.resume)
+
+
+if __name__ == "__main__":
+    main()
