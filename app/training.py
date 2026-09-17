@@ -26,9 +26,6 @@ def load_hourly_data(ticker: str, period: str = "730d") -> pd.DataFrame:
         df.columns = df.columns.get_level_values(0)
     df = df[["Open", "High", "Low", "Close", "Volume"]].dropna().copy()
 
-    # Keep the exchange-local timestamp as model input. Yahoo normally returns
-    # timezone-aware timestamps for intraday data; if it does not, treat them
-    # as New York exchange time rather than the computer's local timezone.
     timestamps = pd.DatetimeIndex(df.index)
     if timestamps.tz is None:
         timestamps = timestamps.tz_localize("America/New_York")
@@ -42,7 +39,6 @@ def load_hourly_data(ticker: str, period: str = "730d") -> pd.DataFrame:
     low = df["Low"].astype(float)
     volume = df["Volume"].astype(float)
 
-    # Price/volume features already used by the model.
     df["return_1h"] = close.pct_change(1)
     df["return_6h"] = close.pct_change(6)
     df["return_24h"] = close.pct_change(24)
@@ -66,10 +62,6 @@ def load_hourly_data(ticker: str, period: str = "730d") -> pd.DataFrame:
     ], axis=1).max(axis=1)
     df["atr_pct"] = tr.rolling(14).mean() / close
 
-    # Time-of-day features. They are known at decision time and contain no
-    # future information. Cyclical encodings help the network understand that
-    # 15:59 and 09:30 are both session-boundary times rather than arbitrary
-    # numeric distances.
     minutes_of_day = timestamps.hour * 60 + timestamps.minute
     day_fraction = minutes_of_day / (24 * 60)
     df["time_sin"] = np.sin(2 * np.pi * day_fraction)
@@ -89,7 +81,6 @@ def load_hourly_data(ticker: str, period: str = "730d") -> pd.DataFrame:
     df["pre_market"] = (minutes_of_day < session_open_min).astype(float)
     df["after_hours"] = (minutes_of_day > session_close_min).astype(float)
 
-    # Intraday context, calculated only from the current and previous bars.
     local_date = timestamps.date
     regular_open = open_.where(regular).groupby(local_date).transform("first")
     session_high = high.where(regular).groupby(local_date).cummax()
@@ -109,7 +100,6 @@ def load_hourly_data(ticker: str, period: str = "730d") -> pd.DataFrame:
     df["bar_return"] = close / open_ - 1
     df["bar_range_pct"] = (high - low) / close.replace(0, np.nan)
 
-    # Gap versus the previous exchange day close.
     daily_close = close.groupby(local_date).last()
     previous_day_close = pd.Series(local_date, index=df.index).map(daily_close.shift(1))
     df["gap_from_prev_close"] = open_ / previous_day_close - 1
@@ -130,8 +120,9 @@ def evaluate(model: PPO, data: pd.DataFrame, label: str) -> dict:
     actions = []
     while not terminated:
         action, _ = model.predict(obs, deterministic=True)
-        actions.append(int(action))
-        obs, _, terminated, _, info = env.step(int(action))
+        action = np.asarray(action, dtype=np.int64).reshape(-1)
+        actions.append(action.tolist())
+        obs, _, terminated, _, info = env.step(action)
     result = {
         "label": label,
         "initial": 500.0,
@@ -158,17 +149,11 @@ def train(
     test_data = data.iloc[split - LOOKBACK:].reset_index(drop=True)
 
     train_env = Monitor(OptionsTradingEnv(
-        train_data,
-        initial_cash=500.0,
-        lookback=LOOKBACK,
-        episode_hours=EPISODE_HOURS,
+        train_data, initial_cash=500.0, lookback=LOOKBACK, episode_hours=EPISODE_HOURS
     ))
     eval_env = Monitor(OptionsTradingEnv(
-        test_data,
-        initial_cash=500.0,
-        lookback=LOOKBACK,
-        episode_hours=EPISODE_HOURS,
-        fixed_start=LOOKBACK,
+        test_data, initial_cash=500.0, lookback=LOOKBACK,
+        episode_hours=EPISODE_HOURS, fixed_start=LOOKBACK
     ))
 
     out_dir = Path("models")
@@ -193,10 +178,9 @@ def train(
         model_file = Path(f"{path}.zip")
         if not model_file.exists():
             raise FileNotFoundError(
-                f"Cannot resume: existing model not found at {model_file}. "
-                "Run once without --resume to create it."
+                f"Cannot resume: existing model not found at {model_file}. Run once without --resume to create it."
             )
-        print(f"Resuming existing model: {model_file}")
+        print(f"Resuming existing trader-action model: {model_file}")
         model = PPO.load(path, env=train_env, device="auto")
         print(f"Continuing training for {timesteps:,} additional timesteps.")
     else:
@@ -214,7 +198,7 @@ def train(
             seed=42,
             device="auto",
         )
-        print(f"Starting new PPO model for {timesteps:,} timesteps.")
+        print(f"Starting new trader-action PPO model for {timesteps:,} timesteps.")
 
     model.learn(
         total_timesteps=timesteps,
@@ -240,13 +224,13 @@ def train(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Train the options RL agent on hourly candles.")
-    parser.add_argument("--ticker", default="SPY")
+    parser.add_argument("--ticker", default="NVDA")
     parser.add_argument("--timesteps", type=int, default=DEFAULT_TIMESTEPS)
     parser.add_argument("--period", default="730d")
     parser.add_argument(
         "--resume",
         action="store_true",
-        help="Continue training the existing saved model instead of starting from scratch.",
+        help="Continue a model created with this same trader-action space. Do not use with older 6-action models.",
     )
     args = parser.parse_args()
     train(args.ticker.upper(), args.timesteps, args.period, args.resume)
