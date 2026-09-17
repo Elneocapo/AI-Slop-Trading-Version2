@@ -8,9 +8,6 @@ import numpy as np
 from gymnasium import spaces
 
 
-# The policy now chooses the operation plus the contract characteristics.
-# Parameters are ignored for HOLD/CLOSE, but keeping one fixed MultiDiscrete
-# action makes the policy compatible with PPO and easy to translate to a broker.
 HOLD = 0
 OPEN_LONG = 1
 OPEN_SHORT = 2
@@ -19,9 +16,6 @@ CLOSE = 3
 CALL = 0
 PUT = 1
 
-# Strike is expressed as a percentage of spot.  Negative = ITM, zero = ATM,
-# positive = OTM for calls; for puts the same offset still identifies a concrete
-# strike, giving the agent a broad but finite option chain to choose from.
 STRIKE_OFFSETS = (-0.10, -0.05, -0.02, -0.01, 0.0, 0.01, 0.02, 0.05, 0.10)
 DTE_DAYS = (1, 3, 5, 7, 14, 30)
 CONTRACT_SIZES = (1, 2, 3, 5, 10)
@@ -29,21 +23,20 @@ CONTRACT_SIZES = (1, 2, 3, 5, 10)
 
 @dataclass
 class Position:
-    kind: int  # 1 call long, -1 put long, 2 call short, -2 put short
+    kind: int
     strike: float
     expiry_t: int
     entry_price: float
     contracts: int
     collateral: float = 0.0
+    entry_t: int = 0
 
 
 class OptionsTradingEnv(gym.Env):
-    """Hourly options environment with trader-style contract selection.
+    """Hourly options environment with broker-style contract selection.
 
-    This is still a synthetic options market: the underlying candles are real
-    historical data while option marks are theoretical Black-Scholes values.
-    The action space is deliberately broker-friendly: operation, call/put,
-    strike bucket, expiry bucket and contract size.
+    The underlying candles are historical market data. Option quotes are still
+    synthetic Black-Scholes marks, so this is not a live options market.
     """
 
     metadata = {"render_modes": []}
@@ -100,8 +93,6 @@ class OptionsTradingEnv(gym.Env):
         )
         self.n_features = len(self.feature_cols) + 1
 
-        # 8 portfolio + 8 current time/session + 5 current-position option
-        # values + 108 candidate contracts * 5 quote/Greek values.
         self.candidate_count = 2 * len(STRIKE_OFFSETS) * len(DTE_DAYS)
         self.context_size = 8 + 8 + 5 + self.candidate_count * 5
         self.action_space = spaces.MultiDiscrete(
@@ -121,6 +112,7 @@ class OptionsTradingEnv(gym.Env):
         self.equity = self.initial_cash
         self.previous_equity = self.initial_cash
         self.peak_equity = self.initial_cash
+        self.trade_log: list[dict] = []
 
     @staticmethod
     def _norm_cdf(x: float) -> float:
@@ -186,49 +178,84 @@ class OptionsTradingEnv(gym.Env):
         contracts = CONTRACT_SIZES[int(size_idx)]
         call = int(option_type) == CALL
         expiry_t = min(self.t + dte_days * 7, self.end_t)
-        price = self._option_price(spot, strike, expiry_t - self.t, self._vol(self.t), call)
+        theoretical = self._option_price(spot, strike, expiry_t - self.t, self._vol(self.t), call)
         cost = self.transaction_cost
 
         if operation == OPEN_LONG:
-            total = price * self.multiplier * contracts + cost
+            execution_price = theoretical * (1.0 + self.slippage)
+            total = execution_price * self.multiplier * contracts + cost
             if total > self.cash:
                 return
             self.cash -= total
             kind = 1 if call else -1
-            self.position = Position(kind, strike, expiry_t, price, contracts)
+            self.position = Position(kind, strike, expiry_t, execution_price, contracts, entry_t=self.t)
         elif operation == OPEN_SHORT:
+            execution_price = theoretical * max(1.0 - self.slippage, 0.0)
             collateral = spot * self.multiplier * contracts * 0.50
-            premium = price * self.multiplier * contracts
+            premium = execution_price * self.multiplier * contracts
             net_cash_needed = collateral - premium + cost
             if net_cash_needed > self.cash:
                 return
             self.cash -= net_cash_needed
             kind = 2 if call else -2
-            self.position = Position(kind, strike, expiry_t, price, contracts, collateral)
+            self.position = Position(kind, strike, expiry_t, execution_price, contracts, collateral, self.t)
 
     def _close(self):
         if self.position is None:
             return
+        position = self.position
         mark = self._mark(self.t)
-        value = mark * self.multiplier * self.position.contracts
-        if self.position.kind in (1, -1):
-            self.cash += max(value * (1 - self.slippage) - self.transaction_cost, 0.0)
+        value = mark * self.multiplier * position.contracts
+        if position.kind in (1, -1):
+            execution_price = mark * max(1.0 - self.slippage, 0.0)
+            proceeds = execution_price * self.multiplier * position.contracts
+            self.cash += max(proceeds - self.transaction_cost, 0.0)
+            pnl = (execution_price - position.entry_price) * self.multiplier * position.contracts - self.transaction_cost
         else:
-            buyback = value * (1 + self.slippage) + self.transaction_cost
-            self.cash += self.position.collateral - buyback
+            execution_price = mark * (1.0 + self.slippage)
+            buyback = execution_price * self.multiplier * position.contracts + self.transaction_cost
+            self.cash += position.collateral - buyback
+            pnl = (position.entry_price - execution_price) * self.multiplier * position.contracts - self.transaction_cost
+
+        self.trade_log.append({
+            "entry_t": position.entry_t,
+            "exit_t": self.t,
+            "kind": position.kind,
+            "strike": position.strike,
+            "contracts": position.contracts,
+            "entry_price": position.entry_price,
+            "exit_price": execution_price,
+            "pnl": pnl,
+            "reason": "close",
+        })
         self.position = None
 
     def _settle_expiry(self):
         if self.position is None or self.t < self.position.expiry_t:
             return
+        position = self.position
         spot = float(self.prices[self.t])
-        call = self.position.kind in (1, 2)
-        intrinsic = max(spot - self.position.strike, 0.0) if call else max(self.position.strike - spot, 0.0)
-        value = intrinsic * self.multiplier * self.position.contracts
-        if self.position.kind in (1, -1):
+        call = position.kind in (1, 2)
+        intrinsic = max(spot - position.strike, 0.0) if call else max(position.strike - spot, 0.0)
+        value = intrinsic * self.multiplier * position.contracts
+        if position.kind in (1, -1):
             self.cash += value
+            pnl = (intrinsic - position.entry_price) * self.multiplier * position.contracts
         else:
-            self.cash += self.position.collateral - value
+            self.cash += position.collateral - value
+            pnl = (position.entry_price - intrinsic) * self.multiplier * position.contracts
+
+        self.trade_log.append({
+            "entry_t": position.entry_t,
+            "exit_t": self.t,
+            "kind": position.kind,
+            "strike": position.strike,
+            "contracts": position.contracts,
+            "entry_price": position.entry_price,
+            "exit_price": intrinsic,
+            "pnl": pnl,
+            "reason": "expiry",
+        })
         self.position = None
 
     def reset(self, *, seed=None, options=None):
@@ -248,6 +275,7 @@ class OptionsTradingEnv(gym.Env):
         self.equity = self.initial_cash
         self.previous_equity = self.initial_cash
         self.peak_equity = self.initial_cash
+        self.trade_log = []
         return self._observation(), {}
 
     def _observation(self):
@@ -287,31 +315,22 @@ class OptionsTradingEnv(gym.Env):
         current_position_option = [0.0] * 5
         if self.position is not None:
             call = self.position.kind in (1, 2)
-            greeks = self._option_greeks(
-                spot, self.position.strike,
-                max(self.position.expiry_t - self.t, 0), vol, call
-            )
+            greeks = self._option_greeks(spot, self.position.strike, max(self.position.expiry_t - self.t, 0), vol, call)
             current_position_option = [
                 greeks[0] / max(spot, 1e-9), greeks[1],
                 greeks[2] * spot, greeks[3] / max(spot, 1e-9),
                 greeks[4] / max(spot, 1e-9),
             ]
 
-        # Quote/Greek matrix for every contract the policy can choose.
-        # Ordering is deterministic: call then put, strike bucket, DTE bucket.
         candidates = []
         for call in (True, False):
             for offset in STRIKE_OFFSETS:
                 strike = max(spot * (1.0 + offset), 0.01)
                 for dte_days in DTE_DAYS:
-                    tau_hours = dte_days * 7
-                    q = self._option_greeks(spot, strike, tau_hours, vol, call)
+                    q = self._option_greeks(spot, strike, dte_days * 7, vol, call)
                     candidates.extend([
-                        q[0] / max(spot, 1e-9),
-                        q[1],
-                        q[2] * spot,
-                        q[3] / max(spot, 1e-9),
-                        q[4] / max(spot, 1e-9),
+                        q[0] / max(spot, 1e-9), q[1], q[2] * spot,
+                        q[3] / max(spot, 1e-9), q[4] / max(spot, 1e-9),
                     ])
 
         portfolio = [
@@ -345,18 +364,28 @@ class OptionsTradingEnv(gym.Env):
             raise ValueError(f"Expected 5 action values, got {action}")
         operation, option_type, strike_idx, dte_idx, size_idx = [int(x) for x in action]
 
+        # Reward must include the complete effect of the action, including
+        # transaction costs and execution slippage. The old implementation
+        # reset the reward baseline after the action, effectively hiding those
+        # costs from the learning signal.
+        pre_action_equity = self._equity(self.t)
+
         if operation in (OPEN_LONG, OPEN_SHORT):
             self._open(operation, option_type, strike_idx, dte_idx, size_idx)
         elif operation == CLOSE:
             self._close()
 
-        self.previous_equity = self._equity(self.t)
         self.t += 1
         self._settle_expiry()
         terminated = self.t >= self.end_t
         self.equity = self._equity(self.t)
         self.peak_equity = max(self.peak_equity, self.equity)
         drawdown = max(0.0, (self.peak_equity - self.equity) / max(self.peak_equity, 1e-9))
-        reward = (self.equity - self.previous_equity) / self.initial_cash
+        reward = (self.equity - pre_action_equity) / self.initial_cash
         reward -= drawdown * 0.02
-        return self._observation(), float(reward), terminated, False, {"equity": self.equity, "drawdown": drawdown}
+        self.previous_equity = self.equity
+        return self._observation(), float(reward), terminated, False, {
+            "equity": self.equity,
+            "drawdown": drawdown,
+            "trade_count": len(self.trade_log),
+        }
