@@ -81,15 +81,18 @@ def load_hourly_data(ticker: str, period: str = "730d") -> pd.DataFrame:
     df["pre_market"] = (minutes_of_day < session_open_min).astype(float)
     df["after_hours"] = (minutes_of_day > session_close_min).astype(float)
 
+    # These session features must never reveal the regular-session open/high/low
+    # during pre-market bars. Only information already available at each bar is
+    # exposed to the policy.
     local_date = timestamps.date
     regular_open = open_.where(regular).groupby(local_date).transform("first")
     session_high = high.where(regular).groupby(local_date).cummax()
     session_low = low.where(regular).groupby(local_date).cummin()
-    df["session_return"] = close / regular_open - 1
-    df["session_high_gap"] = close / session_high - 1
-    df["session_low_gap"] = close / session_low - 1
+    df["session_return"] = (close / regular_open - 1).where(regular, 0.0)
+    df["session_high_gap"] = (close / session_high - 1).where(regular, 0.0)
+    df["session_low_gap"] = (close / session_low - 1).where(regular, 0.0)
     session_range = (session_high - session_low).replace(0, np.nan)
-    df["session_range_position"] = (close - session_low) / session_range
+    df["session_range_position"] = ((close - session_low) / session_range).where(regular, 0.0)
 
     rolling_high_24 = high.rolling(24).max()
     rolling_low_24 = low.rolling(24).min()
