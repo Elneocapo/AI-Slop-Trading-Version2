@@ -72,15 +72,16 @@ class RiskManagedPPOEnv(gym.Wrapper):
         return 1, option_type, strike_idx, dte_idx
 
     def _cheapest_affordable(self, option_type: int, risk_budget: float):
+        decision_t = max(self.env.t - 1, 0)
         spot = float(self.env.prices[decision_t])
-        vol = self.env._vol(self.env.t)
+        vol = self.env._vol(decision_t)
         best = None
         for strike_idx, offset in enumerate(STRIKE_OFFSETS):
             strike = max(spot * (1.0 + offset), 0.01)
             for dte_idx, dte_days in enumerate(DTE_DAYS):
-                expiry_t = min(self.env.t + dte_days * 7, self.env.end_t)
+                expiry_t = min(decision_t + dte_days * 7, self.env.end_t)
                 theoretical = self.env._option_price(
-                    spot, strike, expiry_t - self.env.t, vol, option_type == CALL
+                    spot, strike, expiry_t - decision_t, vol, option_type == CALL
                 )
                 execution_price = theoretical * (1.0 + self.env.slippage)
                 required = execution_price * self.env.multiplier + self.env.transaction_cost
