@@ -346,7 +346,9 @@ def evaluate_oos_segments(model, oos_data: pd.DataFrame, segments: int = 3) -> l
         steps = end - start
         if steps < 50:
             continue
-        window = oos_data.iloc[start - LOOKBACK:end].reset_index(drop=True)
+        # Include the endpoint candle because OptionsTradingEnv needs one extra
+        # row after the final step to compute terminal equity/observation.
+        window = oos_data.iloc[start - LOOKBACK:end + 1].reset_index(drop=True)
         env = RiskManagedPPOEnv(
             OptionsTradingEnv(
                 window,
