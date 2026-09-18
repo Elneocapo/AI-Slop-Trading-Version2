@@ -176,14 +176,19 @@ class OptionsTradingEnv(gym.Env):
     def _open(self, operation: int, option_type: int, strike_idx: int, dte_idx: int, size_idx: int):
         if self.position is not None:
             return
-        spot = float(self.prices[self.t])
+        # The observation contains data only through t-1. Use that last
+        # observed bar for entries instead of the unseen bar at t.
+        decision_t = max(self.t - 1, 0)
+        spot = float(self.prices[decision_t])
         offset = STRIKE_OFFSETS[int(strike_idx)]
         strike = max(spot * (1.0 + offset), 0.01)
         dte_days = DTE_DAYS[int(dte_idx)]
         contracts = CONTRACT_SIZES[int(size_idx)]
         call = int(option_type) == CALL
-        expiry_t = min(self.t + dte_days * 7, self.end_t)
-        theoretical = self._option_price(spot, strike, expiry_t - self.t, self._vol(self.t), call)
+        expiry_t = min(decision_t + dte_days * 7, self.end_t)
+        theoretical = self._option_price(
+            spot, strike, expiry_t - decision_t, self._vol(decision_t), call
+        )
         cost = self.transaction_cost
 
         if operation == OPEN_LONG:
@@ -211,7 +216,8 @@ class OptionsTradingEnv(gym.Env):
         if self.position is None:
             return
         position = self.position
-        mark = self._mark(self.t)
+        decision_t = max(self.t - 1, 0)
+        mark = self._mark(decision_t)
         value = mark * self.multiplier * position.contracts
         if position.kind in (1, -1):
             execution_price = mark * max(1.0 - self.slippage, 0.0)
@@ -298,15 +304,16 @@ class OptionsTradingEnv(gym.Env):
             market.extend(self.features[i].tolist())
             market.append(float(self.highs[i] - self.lows[i]) / max(close, 1e-9))
 
-        equity = self._equity(self.t)
+        decision_t = max(self.t - 1, 0)
+        equity = self._equity(decision_t)
         drawdown = max(0.0, (self.peak_equity - equity) / max(self.peak_equity, 1e-9))
         position_flag = 0.0 if self.position is None else float(self.position.kind)
         position_pnl = 0.0
         if self.position is not None:
             direction = 1.0 if self.position.kind in (1, -1) else -1.0
-            position_pnl = direction * (self._mark(self.t) - self.position.entry_price) * self.multiplier * self.position.contracts
+            position_pnl = direction * (self._mark(decision_t) - self.position.entry_price) * self.multiplier * self.position.contracts
 
-        timestamp = self.data.loc[self.t, "timestamp"] if "timestamp" in self.data.columns else None
+        timestamp = self.data.loc[decision_t, "timestamp"] if "timestamp" in self.data.columns else None
         if timestamp is not None:
             minutes = timestamp.hour * 60 + timestamp.minute
             session_open = 9 * 60 + 30
@@ -322,12 +329,12 @@ class OptionsTradingEnv(gym.Env):
             session_elapsed = time_to_close = time_sin = time_cos = 0.0
             regular = near_open = near_close = 0.0
 
-        spot = float(self.prices[self.t])
-        vol = self._vol(self.t)
+        spot = float(self.prices[decision_t])
+        vol = self._vol(decision_t)
         current_position_option = [0.0] * 5
         if self.position is not None:
             call = self.position.kind in (1, 2)
-            greeks = self._option_greeks(spot, self.position.strike, max(self.position.expiry_t - self.t, 0), vol, call)
+            greeks = self._option_greeks(spot, self.position.strike, max(self.position.expiry_t - decision_t, 0), vol, call)
             current_position_option = [
                 greeks[0] / max(spot, 1e-9), greeks[1],
                 greeks[2] * spot, greeks[3] / max(spot, 1e-9),
@@ -380,7 +387,8 @@ class OptionsTradingEnv(gym.Env):
         # transaction costs and execution slippage. The old implementation
         # reset the reward baseline after the action, effectively hiding those
         # costs from the learning signal.
-        pre_action_equity = self._equity(self.t)
+        decision_t = max(self.t - 1, 0)
+        pre_action_equity = self._equity(decision_t)
 
         if operation in (OPEN_LONG, OPEN_SHORT):
             self._open(operation, option_type, strike_idx, dte_idx, size_idx)
