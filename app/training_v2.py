@@ -559,7 +559,7 @@ def main():
         print("\n=== OOS SEGMENT CHECK (SAME 145-DAY OOS PERIOD) ===")
         for w in windows:
             print(
-                f"Window {w['window']}: return {w['return_pct']:.2f}% | "
+                f"Segment {w['segment']}: return {w['return_pct']:.2f}% | "
                 f"buy&hold {w['buy_hold_return_pct']:.2f}% | "
                 f"max DD {w['max_drawdown_pct']:.2f}% | "
                 f"trades {w['trades']} | win rate {w['win_rate_pct']:.2f}%"
