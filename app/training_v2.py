@@ -452,8 +452,43 @@ def main():
     p.add_argument("--timesteps", type=int, default=DEFAULT_TIMESTEPS)
     p.add_argument("--period", default="730d")
     p.add_argument("--resume", action="store_true")
+    p.add_argument("--eval-only", action="store_true", help="Evaluate the saved model without training.")
     a = p.parse_args()
-    train(a.ticker.upper(), a.timesteps, a.period, a.resume)
+    ticker = a.ticker.upper()
+    if a.eval_only:
+        data = load_hourly_data(ticker, a.period)
+        split = len(data) - EPISODE_HOURS - 1
+        test_data = data.iloc[split - LOOKBACK:].reset_index(drop=True)
+        model_path = Path("models") / f"ppo_options_{ticker.lower()}.zip"
+        if not model_path.exists():
+            raise FileNotFoundError(f"Saved model not found: {model_path}")
+        model = MaskablePPO.load(model_path, device="auto")
+        r = evaluate(model, test_data, report_dir=Path("training_eval") / "latest_oos")
+        print("\n=== 145-DAY OUT-OF-SAMPLE EVALUATION (SAVED MODEL) ===")
+        print(f"Ticker: {ticker}")
+        print("Initial capital: €500.00")
+        print(f"Final equity: €{r['final']:,.2f}")
+        print(f"P&L: €{r['pnl']:,.2f}")
+        print(f"Return: {r['return_pct']:.2f}%")
+        print(f"Max drawdown: {r['max_drawdown_pct']:.2f}%")
+        print(f"Closed trades: {r['trade_count']}")
+        print(f"Win rate: {r['win_rate_pct']:.2f}% ({r['win_count']}W / {r['loss_count']}L)")
+        print(f"Calls: {r['call_count']} | Puts: {r['put_count']}")
+        print(f"Best trade P&L: €{r['best_trade']:,.2f}")
+        print(f"Worst trade P&L: €{r['worst_trade']:,.2f}")
+        print(f"Sum of closed-trade P&L: €{r['total_trade_pnl']:,.2f}")
+        print(
+            f"Action distribution: HOLD {r['action_counts']['hold']} | CLOSE {r['action_counts']['close']} | "
+            f"OPEN_CALL {r['action_counts']['open_call']} | OPEN_PUT {r['action_counts']['open_put']}"
+        )
+        print(f"Risk-rejected actions: {r['risk_rejected']}")
+        print(f"Invalid-action reasons: {r['invalid_reasons']}")
+        print(f"Max entry cost observed: €{r['max_entry_notional']:,.2f}")
+        print(f"Open position at test end: {'YES' if r['open_position'] else 'NO'}")
+        print(f"Risk limit: {MAX_TRADE_RISK_PCT * 100:.0f}% of current equity per new position")
+        print("OOS audit files: training_eval\\latest_oos")
+    else:
+        train(ticker, a.timesteps, a.period, a.resume)
 
 
 if __name__ == "__main__":
