@@ -297,6 +297,10 @@ def evaluate(model, data: pd.DataFrame, report_dir: Path | None = None) -> dict:
             "max_drawdown_pct": float(-info["drawdown"] * 100),
             "best_trade": float(max(trade_pnls, default=0.0)),
             "worst_trade": float(min(trade_pnls, default=0.0)),
+            "sum_trade_pnl": float(sum(trade_pnls)),
+            "transaction_costs": float(env.env.total_transaction_costs),
+            "equity_minus_500": float(env.equity - 500.0),
+            "pnl_reconciliation_difference": float(sum(trade_pnls) - (env.equity - 500.0)),
             **{f"invalid_{k}": v for k, v in invalid_reasons.items()},
         }]).to_csv(report_dir / "oos_action_audit.csv", index=False)
 
