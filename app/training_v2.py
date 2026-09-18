@@ -7,8 +7,8 @@ import gymnasium as gym
 import numpy as np
 import pandas as pd
 import yfinance as yf
-from stable_baselines3 import PPO
-from stable_baselines3.common.callbacks import EvalCallback
+from sb3_contrib import MaskablePPO
+from sb3_contrib.common.maskable.callbacks import MaskableEvalCallback
 from stable_baselines3.common.monitor import Monitor
 
 from app.environment.options_env import CALL, CONTRACT_SIZES, DTE_DAYS, STRIKE_OFFSETS, OptionsTradingEnv
@@ -44,6 +44,16 @@ class RiskManagedPPOEnv(gym.Wrapper):
     @property
     def position(self):
         return self.env.position
+
+    def action_masks(self):
+        """Return the state-dependent valid actions for MaskablePPO."""
+        mask = np.zeros(self.ACTION_COUNT, dtype=bool)
+        mask[0] = True  # HOLD is always valid.
+        if self.env.position is not None:
+            mask[1] = True  # CLOSE is valid only while a position is open.
+        else:
+            mask[2:] = True  # OPEN_CALL / OPEN_PUT choices.
+        return mask
 
     def _decode(self, action: int):
         action = int(np.asarray(action).item())
@@ -349,7 +359,7 @@ def train(ticker: str, timesteps: int = DEFAULT_TIMESTEPS, period: str = "730d",
     best = out / "best"
     best.mkdir(exist_ok=True)
     path = out / f"ppo_options_{ticker.lower()}"
-    callback = EvalCallback(
+    callback = MaskableEvalCallback(
         eval_env,
         best_model_save_path=str(best),
         log_path=str(logs),
@@ -361,7 +371,7 @@ def train(ticker: str, timesteps: int = DEFAULT_TIMESTEPS, period: str = "730d",
 
     if resume:
         raise ValueError("--resume is disabled for the new joint Discrete action space. Start a fresh model.")
-    model = PPO(
+    model = MaskablePPO(
         "MlpPolicy",
         train_env,
         learning_rate=3e-4,
