@@ -155,7 +155,9 @@ def load_hourly_data(ticker: str, period: str = "730d") -> pd.DataFrame:
     df["return_24h"] = close.pct_change(24)
     df["sma24_gap"] = close / close.rolling(24).mean() - 1
     df["sma72_gap"] = close / close.rolling(72).mean() - 1
-    df["volatility_24h"] = df["return_1h"].rolling(24).std() * np.sqrt(24 * 252)
+    # Yahoo 1h data is approximately 7 regular-session bars per trading day.
+    # Annualize using trading-session hours, not 24 calendar hours.
+    df["volatility_24h"] = df["return_1h"].rolling(24).std() * np.sqrt(7 * 252)
     vm = volume.rolling(48).mean()
     vs = volume.rolling(48).std().replace(0, np.nan)
     df["volume_z"] = (volume - vm) / vs
