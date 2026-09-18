@@ -113,6 +113,7 @@ class OptionsTradingEnv(gym.Env):
         self.previous_equity = self.initial_cash
         self.peak_equity = self.initial_cash
         self.trade_log: list[dict] = []
+        self.total_transaction_costs = 0.0
 
     @staticmethod
     def _norm_cdf(x: float) -> float:
@@ -191,6 +192,7 @@ class OptionsTradingEnv(gym.Env):
             if total > self.cash:
                 return
             self.cash -= total
+            self.total_transaction_costs += cost
             kind = 1 if call else -1
             self.position = Position(kind, strike, expiry_t, execution_price, contracts, entry_t=self.t)
         elif operation == OPEN_SHORT:
@@ -201,6 +203,7 @@ class OptionsTradingEnv(gym.Env):
             if net_cash_needed > self.cash:
                 return
             self.cash -= net_cash_needed
+            self.total_transaction_costs += cost
             kind = 2 if call else -2
             self.position = Position(kind, strike, expiry_t, execution_price, contracts, collateral, self.t)
 
@@ -214,11 +217,13 @@ class OptionsTradingEnv(gym.Env):
             execution_price = mark * max(1.0 - self.slippage, 0.0)
             proceeds = execution_price * self.multiplier * position.contracts
             self.cash += max(proceeds - self.transaction_cost, 0.0)
+            self.total_transaction_costs += self.transaction_cost
             pnl = (execution_price - position.entry_price) * self.multiplier * position.contracts - (2.0 * self.transaction_cost)
         else:
             execution_price = mark * (1.0 + self.slippage)
             buyback = execution_price * self.multiplier * position.contracts + self.transaction_cost
             self.cash += position.collateral - buyback
+            self.total_transaction_costs += self.transaction_cost
             pnl = (position.entry_price - execution_price) * self.multiplier * position.contracts - (2.0 * self.transaction_cost)
 
         self.trade_log.append({
@@ -231,6 +236,7 @@ class OptionsTradingEnv(gym.Env):
             "exit_price": execution_price,
             "pnl": pnl,
             "reason": "close",
+            "transaction_costs": 2.0 * self.transaction_cost,
         })
         self.position = None
 
@@ -259,6 +265,7 @@ class OptionsTradingEnv(gym.Env):
             "exit_price": intrinsic,
             "pnl": pnl,
             "reason": "expiry",
+            "transaction_costs": self.transaction_cost,
         })
         self.position = None
 
@@ -280,6 +287,7 @@ class OptionsTradingEnv(gym.Env):
         self.previous_equity = self.initial_cash
         self.peak_equity = self.initial_cash
         self.trade_log = []
+        self.total_transaction_costs = 0.0
         return self._observation(), {}
 
     def _observation(self):
