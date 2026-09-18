@@ -23,9 +23,12 @@ INVALID_ACTION_PENALTY = 0.0005
 class RiskManagedPPOEnv(gym.Wrapper):
     """Expose a compact joint action space and enforce hard account risk."""
 
-    # 0 HOLD, 1 OPEN_LONG, 2 CLOSE. For OPEN_LONG the agent chooses type/strike/DTE;
-    # contract count is selected by the risk manager so an impossible size cannot be learned.
-    ACTION_COUNT = 3 * 2 * len(STRIKE_OFFSETS) * len(DTE_DAYS)
+    # 0 HOLD, 1 CLOSE, then one block per option type for OPEN_LONG.
+    # HOLD/CLOSE have no meaningful type/strike/DTE, so they get exactly one action
+    # each instead of dozens of duplicate actions. Contract count is selected by
+    # the risk manager so an impossible size cannot be learned.
+    OPEN_ACTIONS = 2 * len(STRIKE_OFFSETS) * len(DTE_DAYS)
+    ACTION_COUNT = 2 + OPEN_ACTIONS
 
     def __init__(self, env: OptionsTradingEnv, max_trade_risk_pct: float = MAX_TRADE_RISK_PCT):
         super().__init__(env)
@@ -43,14 +46,17 @@ class RiskManagedPPOEnv(gym.Wrapper):
 
     def _decode(self, action: int):
         action = int(np.asarray(action).item())
-        per_operation = 2 * len(STRIKE_OFFSETS) * len(DTE_DAYS)
-        operation = action // per_operation
-        rem = action % per_operation
-        option_type = rem // (len(STRIKE_OFFSETS) * len(DTE_DAYS))
-        rem %= len(STRIKE_OFFSETS) * len(DTE_DAYS)
+        if action == 0:
+            return 0, 0, 0, 0  # HOLD
+        if action == 1:
+            return 2, 0, 0, 0  # CLOSE
+        idx = action - 2
+        per_type = len(STRIKE_OFFSETS) * len(DTE_DAYS)
+        option_type = idx // per_type
+        rem = idx % per_type
         strike_idx = rem // len(DTE_DAYS)
         dte_idx = rem % len(DTE_DAYS)
-        return operation, option_type, strike_idx, dte_idx
+        return 1, option_type, strike_idx, dte_idx  # OPEN_LONG
 
     def _cheapest_affordable(self, option_type: int, risk_budget: float):
         spot = float(self.env.prices[self.env.t])
@@ -75,9 +81,9 @@ class RiskManagedPPOEnv(gym.Wrapper):
         self.last_rejected = False
 
         if operation == 0:
-            return np.array([0, option_type, strike_idx, dte_idx, 0], dtype=np.int64)
+            return np.array([0, 0, 0, 0, 0], dtype=np.int64)
         if operation == 2:
-            return np.array([3, option_type, strike_idx, dte_idx, 0], dtype=np.int64)
+            return np.array([3, 0, 0, 0, 0], dtype=np.int64)
 
         if self.env.position is not None:
             self.last_rejected = True
@@ -232,6 +238,17 @@ def evaluate(model, data: pd.DataFrame) -> dict:
         "total_trade_pnl": float(sum(t["pnl"] for t in trades)),
         "best_trade": float(max((t["pnl"] for t in trades), default=0.0)),
         "worst_trade": float(min((t["pnl"] for t in trades), default=0.0)),
+        "open_position": env.position is not None,
+        "open_position_unrealized_pnl": (
+            float((env._mark(env.t) - env.position.entry_price) * env.multiplier * env.position.contracts)
+            if env.position is not None else 0.0
+        ),
+        "action_counts": {
+            "hold": sum(a == 0 for a in actions),
+            "close": sum(a == 1 for a in actions),
+            "open_call": sum(2 <= a < 2 + len(STRIKE_OFFSETS) * len(DTE_DAYS) for a in actions),
+            "open_put": sum(a >= 2 + len(STRIKE_OFFSETS) * len(DTE_DAYS) for a in actions),
+        },
     }
 
 
@@ -252,7 +269,7 @@ def train(ticker: str, timesteps: int = DEFAULT_TIMESTEPS, period: str = "730d",
     callback = EvalCallback(eval_env, best_model_save_path=str(best), log_path=str(logs), eval_freq=50_000, n_eval_episodes=1, deterministic=True, verbose=1)
 
     # Old checkpoints used the 5-dimensional MultiDiscrete action space and are
-    # intentionally not resumable with this new 324-action policy.
+    # intentionally not resumable with this new compact 110-action policy.
     if resume:
         raise ValueError("--resume is disabled for the new joint Discrete action space. Start a fresh model.")
     model = PPO("MlpPolicy", train_env, learning_rate=3e-4, n_steps=2048, batch_size=256,
@@ -268,7 +285,11 @@ def train(ticker: str, timesteps: int = DEFAULT_TIMESTEPS, period: str = "730d",
     print(f"Final equity: €{r['final']:,.2f}\nP&L: €{r['pnl']:,.2f}\nReturn: {r['return_pct']:.2f}%\nMax drawdown: {r['max_drawdown_pct']:.2f}%")
     print(f"Closed trades: {r['trade_count']}\nWin rate: {r['win_rate_pct']:.2f}% ({r['win_count']}W / {r['loss_count']}L)")
     print(f"Long trades: {r['long_count']} | Short trades: {r['short_count']}\nCalls: {r['call_count']} | Puts: {r['put_count']}")
-    print(f"Best trade P&L: €{r['best_trade']:,.2f}\nWorst trade P&L: €{r['worst_trade']:,.2f}\nSum of trade P&L: €{r['total_trade_pnl']:,.2f}")
+    print(f"Best trade P&L: €{r['best_trade']:,.2f}\nWorst trade P&L: €{r['worst_trade']:,.2f}\nSum of closed-trade P&L: €{r['total_trade_pnl']:,.2f}")
+    print(f"Action distribution: HOLD {r['action_counts']['hold']} | CLOSE {r['action_counts']['close']} | OPEN_CALL {r['action_counts']['open_call']} | OPEN_PUT {r['action_counts']['open_put']}")
+    print(f"Open position at test end: {'YES' if r['open_position'] else 'NO'}")
+    if r["open_position"]:
+        print(f"Open-position unrealized P&L: €{r['open_position_unrealized_pnl']:,.2f}")
     print(f"Risk limit: {MAX_TRADE_RISK_PCT * 100:.0f}% of current equity per new position")
     print("No closed trades recorded in the out-of-sample test." if not r["trades"] else "Trade log recorded.")
     print(f"Model saved: {path}.zip")
