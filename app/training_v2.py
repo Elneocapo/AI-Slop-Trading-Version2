@@ -111,7 +111,13 @@ class RiskManagedPPOEnv(gym.Wrapper):
 
         decision_t = max(self.env.t - 1, 0)
         equity = max(float(self.env._equity(decision_t)), 0.0)
-        risk_budget = equity * self.max_trade_risk_pct
+        # Keep the absolute premium-at-risk bounded for a small account.
+        # Risk may shrink with drawdowns, but it cannot compound without bound
+        # merely because the synthetic account has grown.
+        risk_budget = min(
+            equity * self.max_trade_risk_pct,
+            float(self.env.initial_cash) * self.max_trade_risk_pct,
+        )
         if risk_budget <= self.env.transaction_cost:
             self.last_rejected = True
             self.last_invalid_reason = "risk_budget_too_small"
@@ -507,7 +513,7 @@ def train(ticker: str, timesteps: int = DEFAULT_TIMESTEPS, period: str = "730d",
     print(f"Open position at test end: {'YES' if r['open_position'] else 'NO'}")
     if r["open_position"]:
         print(f"Open-position unrealized P&L: €{r['open_position_unrealized_pnl']:,.2f}")
-    print(f"Risk limit: {MAX_TRADE_RISK_PCT * 100:.0f}% of current equity per new position")
+    print(f"Risk limit: min({MAX_TRADE_RISK_PCT * 100:.0f}% current equity, {MAX_TRADE_RISK_PCT * 100:.0f}% initial capital) per new position")
     print(f"OOS audit files: {report_dir}")
     print("No closed trades recorded in the out-of-sample test." if not r["trades"] else "Trade log recorded.")
     print(f"Model saved: {path}.zip")
@@ -554,7 +560,7 @@ def main():
         print(f"Invalid-action reasons: {r['invalid_reasons']}")
         print(f"Max entry cost observed: €{r['max_entry_notional']:,.2f}")
         print(f"Open position at test end: {'YES' if r['open_position'] else 'NO'}")
-        print(f"Risk limit: {MAX_TRADE_RISK_PCT * 100:.0f}% of current equity per new position")
+        print(f"Risk limit: min({MAX_TRADE_RISK_PCT * 100:.0f}% current equity, {MAX_TRADE_RISK_PCT * 100:.0f}% initial capital) per new position")
         windows = evaluate_oos_segments(model, test_data)
         pd.DataFrame(windows).to_csv(Path("training_eval") / "latest_oos" / "oos_multi_window_audit.csv", index=False)
         print("OOS audit files: training_eval\\latest_oos")
