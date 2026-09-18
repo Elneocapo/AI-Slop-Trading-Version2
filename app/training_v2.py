@@ -24,9 +24,6 @@ class RiskManagedPPOEnv(gym.Wrapper):
     """Expose a compact joint action space and enforce hard account risk."""
 
     # 0 HOLD, 1 CLOSE, then one block per option type for OPEN_LONG.
-    # HOLD/CLOSE have no meaningful type/strike/DTE, so they get exactly one action
-    # each instead of dozens of duplicate actions. Contract count is selected by
-    # the risk manager so an impossible size cannot be learned.
     OPEN_ACTIONS = 2 * len(STRIKE_OFFSETS) * len(DTE_DAYS)
     ACTION_COUNT = 2 + OPEN_ACTIONS
 
@@ -51,16 +48,16 @@ class RiskManagedPPOEnv(gym.Wrapper):
     def _decode(self, action: int):
         action = int(np.asarray(action).item())
         if action == 0:
-            return 0, 0, 0, 0  # HOLD
+            return 0, 0, 0, 0
         if action == 1:
-            return 2, 0, 0, 0  # CLOSE
+            return 2, 0, 0, 0
         idx = action - 2
         per_type = len(STRIKE_OFFSETS) * len(DTE_DAYS)
         option_type = idx // per_type
         rem = idx % per_type
         strike_idx = rem // len(DTE_DAYS)
         dte_idx = rem % len(DTE_DAYS)
-        return 1, option_type, strike_idx, dte_idx  # OPEN_LONG
+        return 1, option_type, strike_idx, dte_idx
 
     def _cheapest_affordable(self, option_type: int, risk_budget: float):
         spot = float(self.env.prices[self.env.t])
@@ -99,8 +96,6 @@ class RiskManagedPPOEnv(gym.Wrapper):
             self.last_rejected = True
             return np.array([0, option_type, strike_idx, dte_idx, 0], dtype=np.int64)
 
-        # First honor the model's selected contract. If it is too expensive, select the
-        # cheapest contract of the same option type that still satisfies the hard limit.
         spot = float(self.env.prices[self.env.t])
         strike = max(spot * (1.0 + STRIKE_OFFSETS[strike_idx]), 0.01)
         expiry_t = min(self.env.t + DTE_DAYS[dte_idx] * 7, self.env.end_t)
@@ -190,8 +185,6 @@ def load_hourly_data(ticker: str, period: str = "730d") -> pd.DataFrame:
     df["pre_market"] = (minutes < open_min).astype(float)
     df["after_hours"] = (minutes > close_min).astype(float)
 
-    # Only information available up to each bar is used. The opening value for a
-    # regular session is forward-filled after it actually occurs, never backwards.
     local_date = pd.Series(timestamps.date, index=df.index)
     regular_open = open_.where(regular).groupby(local_date).transform("first")
     df["session_return"] = (close / regular_open - 1).where(regular, 0.0)
@@ -214,45 +207,93 @@ def load_hourly_data(ticker: str, period: str = "730d") -> pd.DataFrame:
     return df.dropna().reset_index(drop=True)
 
 
-def evaluate(model, data: pd.DataFrame) -> dict:
-    env = RiskManagedPPOEnv(OptionsTradingEnv(data, initial_cash=500.0, lookback=LOOKBACK, episode_hours=EPISODE_HOURS, fixed_start=LOOKBACK))
+def evaluate(model, data: pd.DataFrame, report_dir: Path | None = None) -> dict:
+    env = RiskManagedPPOEnv(
+        OptionsTradingEnv(
+            data,
+            initial_cash=500.0,
+            lookback=LOOKBACK,
+            episode_hours=EPISODE_HOURS,
+            fixed_start=LOOKBACK,
+        )
+    )
     obs, _ = env.reset(seed=123)
     terminated = False
     actions = []
-    info = {"drawdown": 0.0}
+    rejected = 0
     while not terminated:
         action, _ = model.predict(obs, deterministic=True)
         action = int(np.asarray(action).item())
         actions.append(action)
         obs, _, terminated, _, info = env.step(action)
+        rejected += int(info.get("risk_rejected", False))
+
     trades = list(env.trade_log)
     wins = [t for t in trades if t["pnl"] > 0]
     losses = [t for t in trades if t["pnl"] < 0]
+    action_counts = {
+        "hold": sum(a == 0 for a in actions),
+        "close": sum(a == 1 for a in actions),
+        "open_call": sum(2 <= a < 2 + len(STRIKE_OFFSETS) * len(DTE_DAYS) for a in actions),
+        "open_put": sum(a >= 2 + len(STRIKE_OFFSETS) * len(DTE_DAYS) for a in actions),
+    }
+    trade_pnls = [float(t["pnl"]) for t in trades]
+    max_trade_risk = max(
+        (
+            float(t["entry_price"]) * env.env.multiplier * int(t["contracts"]) + env.env.transaction_cost
+            for t in trades
+            if t["kind"] in (1, -1)
+        ),
+        default=0.0,
+    )
+
+    if report_dir is not None:
+        report_dir.mkdir(parents=True, exist_ok=True)
+        if trades:
+            audit = pd.DataFrame(trades)
+            audit["option_type"] = audit["kind"].map({1: "CALL", -1: "PUT", 2: "SHORT_CALL", -2: "SHORT_PUT"})
+            audit.to_csv(report_dir / "oos_trade_audit.csv", index=False)
+        pd.DataFrame([{
+            "hold": action_counts["hold"],
+            "close": action_counts["close"],
+            "open_call": action_counts["open_call"],
+            "open_put": action_counts["open_put"],
+            "risk_rejected": rejected,
+            "trade_count": len(trades),
+            "win_count": len(wins),
+            "loss_count": len(losses),
+            "final_equity": float(env.equity),
+            "max_drawdown_pct": float(-info["drawdown"] * 100),
+            "best_trade": float(max(trade_pnls, default=0.0)),
+            "worst_trade": float(min(trade_pnls, default=0.0)),
+        }]).to_csv(report_dir / "oos_action_audit.csv", index=False)
+
     return {
-        "final": float(env.equity), "pnl": float(env.equity - 500.0),
+        "final": float(env.equity),
+        "pnl": float(env.equity - 500.0),
         "return_pct": float((env.equity / 500.0 - 1) * 100),
         "max_drawdown_pct": float(-info["drawdown"] * 100),
-        "trades": trades, "actions": actions, "trade_count": len(trades),
-        "win_count": len(wins), "loss_count": len(losses),
+        "trades": trades,
+        "actions": actions,
+        "trade_count": len(trades),
+        "win_count": len(wins),
+        "loss_count": len(losses),
         "win_rate_pct": len(wins) / len(trades) * 100 if trades else 0.0,
         "long_count": sum(t["kind"] in (1, -1) for t in trades),
         "short_count": sum(t["kind"] in (2, -2) for t in trades),
         "call_count": sum(t["kind"] in (1, 2) for t in trades),
         "put_count": sum(t["kind"] in (-1, -2) for t in trades),
         "total_trade_pnl": float(sum(t["pnl"] for t in trades)),
-        "best_trade": float(max((t["pnl"] for t in trades), default=0.0)),
-        "worst_trade": float(min((t["pnl"] for t in trades), default=0.0)),
+        "best_trade": float(max(trade_pnls, default=0.0)),
+        "worst_trade": float(min(trade_pnls, default=0.0)),
         "open_position": env.position is not None,
         "open_position_unrealized_pnl": (
             float((env.env._mark(env.env.t) - env.position.entry_price) * env.env.multiplier * env.position.contracts)
             if env.position is not None else 0.0
         ),
-        "action_counts": {
-            "hold": sum(a == 0 for a in actions),
-            "close": sum(a == 1 for a in actions),
-            "open_call": sum(2 <= a < 2 + len(STRIKE_OFFSETS) * len(DTE_DAYS) for a in actions),
-            "open_put": sum(a >= 2 + len(STRIKE_OFFSETS) * len(DTE_DAYS) for a in actions),
-        },
+        "action_counts": action_counts,
+        "risk_rejected": rejected,
+        "max_entry_notional": max_trade_risk,
     }
 
 
@@ -264,25 +305,62 @@ def train(ticker: str, timesteps: int = DEFAULT_TIMESTEPS, period: str = "730d",
     train_data = data.iloc[:split].reset_index(drop=True)
     test_data = data.iloc[split - LOOKBACK:].reset_index(drop=True)
 
-    train_env = Monitor(RiskManagedPPOEnv(OptionsTradingEnv(train_data, initial_cash=500.0, lookback=LOOKBACK, episode_hours=EPISODE_HOURS)))
-    eval_env = Monitor(RiskManagedPPOEnv(OptionsTradingEnv(test_data, initial_cash=500.0, lookback=LOOKBACK, episode_hours=EPISODE_HOURS, fixed_start=LOOKBACK)))
-    out = Path("models"); out.mkdir(exist_ok=True)
-    logs = Path("training_eval"); logs.mkdir(exist_ok=True)
-    best = out / "best"; best.mkdir(exist_ok=True)
+    train_env = Monitor(
+        RiskManagedPPOEnv(
+            OptionsTradingEnv(train_data, initial_cash=500.0, lookback=LOOKBACK, episode_hours=EPISODE_HOURS)
+        )
+    )
+    eval_env = Monitor(
+        RiskManagedPPOEnv(
+            OptionsTradingEnv(
+                test_data,
+                initial_cash=500.0,
+                lookback=LOOKBACK,
+                episode_hours=EPISODE_HOURS,
+                fixed_start=LOOKBACK,
+            )
+        )
+    )
+    out = Path("models")
+    out.mkdir(exist_ok=True)
+    logs = Path("training_eval")
+    logs.mkdir(exist_ok=True)
+    best = out / "best"
+    best.mkdir(exist_ok=True)
     path = out / f"ppo_options_{ticker.lower()}"
-    callback = EvalCallback(eval_env, best_model_save_path=str(best), log_path=str(logs), eval_freq=50_000, n_eval_episodes=1, deterministic=True, verbose=1)
+    callback = EvalCallback(
+        eval_env,
+        best_model_save_path=str(best),
+        log_path=str(logs),
+        eval_freq=50_000,
+        n_eval_episodes=1,
+        deterministic=True,
+        verbose=1,
+    )
 
-    # Old checkpoints used the 5-dimensional MultiDiscrete action space and are
-    # intentionally not resumable with this new compact 110-action policy.
     if resume:
         raise ValueError("--resume is disabled for the new joint Discrete action space. Start a fresh model.")
-    model = PPO("MlpPolicy", train_env, learning_rate=3e-4, n_steps=2048, batch_size=256,
-                gamma=0.995, gae_lambda=0.95, ent_coef=0.05, clip_range=0.2,
-                verbose=1, seed=42, device="auto")
+    model = PPO(
+        "MlpPolicy",
+        train_env,
+        learning_rate=3e-4,
+        n_steps=2048,
+        batch_size=256,
+        gamma=0.995,
+        gae_lambda=0.95,
+        ent_coef=0.05,
+        clip_range=0.2,
+        verbose=1,
+        seed=42,
+        device="auto",
+    )
     print(f"Starting NEW joint-action PPO model for {timesteps:,} timesteps.")
     model.learn(total_timesteps=timesteps, callback=callback, progress_bar=True)
     model.save(path)
-    r = evaluate(model, test_data)
+
+    report_dir = Path("training_eval") / "latest_oos"
+    r = evaluate(model, test_data, report_dir=report_dir)
+
     print("\n=== 145-DAY OUT-OF-SAMPLE TEST ===")
     print(f"Ticker: {ticker}\nLookback: {LOOKBACK} hourly candles\nEpisode: {EPISODE_HOURS} hourly steps (~145 trading days)")
     print("Initial capital: €500.00")
@@ -290,11 +368,17 @@ def train(ticker: str, timesteps: int = DEFAULT_TIMESTEPS, period: str = "730d",
     print(f"Closed trades: {r['trade_count']}\nWin rate: {r['win_rate_pct']:.2f}% ({r['win_count']}W / {r['loss_count']}L)")
     print(f"Long trades: {r['long_count']} | Short trades: {r['short_count']}\nCalls: {r['call_count']} | Puts: {r['put_count']}")
     print(f"Best trade P&L: €{r['best_trade']:,.2f}\nWorst trade P&L: €{r['worst_trade']:,.2f}\nSum of closed-trade P&L: €{r['total_trade_pnl']:,.2f}")
-    print(f"Action distribution: HOLD {r['action_counts']['hold']} | CLOSE {r['action_counts']['close']} | OPEN_CALL {r['action_counts']['open_call']} | OPEN_PUT {r['action_counts']['open_put']}")
+    print(
+        f"Action distribution: HOLD {r['action_counts']['hold']} | CLOSE {r['action_counts']['close']} | "
+        f"OPEN_CALL {r['action_counts']['open_call']} | OPEN_PUT {r['action_counts']['open_put']}"
+    )
+    print(f"Risk-rejected actions: {r['risk_rejected']}")
+    print(f"Max entry cost observed: €{r['max_entry_notional']:,.2f}")
     print(f"Open position at test end: {'YES' if r['open_position'] else 'NO'}")
     if r["open_position"]:
         print(f"Open-position unrealized P&L: €{r['open_position_unrealized_pnl']:,.2f}")
     print(f"Risk limit: {MAX_TRADE_RISK_PCT * 100:.0f}% of current equity per new position")
+    print(f"OOS audit files: {report_dir}")
     print("No closed trades recorded in the out-of-sample test." if not r["trades"] else "Trade log recorded.")
     print(f"Model saved: {path}.zip")
     print(f"Best checkpoint: {best / 'best_model.zip'}")
