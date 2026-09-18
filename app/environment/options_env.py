@@ -216,7 +216,7 @@ class OptionsTradingEnv(gym.Env):
         if position.kind in (1, -1):
             execution_price = mark * max(1.0 - self.slippage, 0.0)
             proceeds = execution_price * self.multiplier * position.contracts
-            self.cash += max(proceeds - self.transaction_cost, 0.0)
+            self.cash += proceeds - self.transaction_cost
             self.total_transaction_costs += self.transaction_cost
             pnl = (execution_price - position.entry_price) * self.multiplier * position.contracts - (2.0 * self.transaction_cost)
         else:
