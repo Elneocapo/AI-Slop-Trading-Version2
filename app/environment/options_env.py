@@ -125,7 +125,9 @@ class OptionsTradingEnv(gym.Env):
     def _option_price(self, spot: float, strike: float, tau_hours: float, vol: float, call: bool) -> float:
         if tau_hours <= 0:
             return max(spot - strike, 0.0) if call else max(strike - spot, 0.0)
-        tau = tau_hours / (24.0 * 252.0)
+        # Episodes use roughly 7 hourly trading bars per regular-session day.
+        # Convert bar-hours to trading years consistently with DTE/expiry_t.
+        tau = tau_hours / (7.0 * 252.0)
         vol = max(float(vol), 0.15)
         d1 = (log(max(spot, 1e-9) / max(strike, 1e-9)) + 0.5 * vol * vol * tau) / (vol * sqrt(tau))
         d2 = d1 - vol * sqrt(tau)
@@ -140,7 +142,9 @@ class OptionsTradingEnv(gym.Env):
             intrinsic = max(spot - strike, 0.0) if call else max(strike - spot, 0.0)
             delta = 1.0 if call and spot > strike else -1.0 if (not call and spot < strike) else 0.0
             return intrinsic, delta, 0.0, 0.0, 0.0
-        tau = tau_hours / (24.0 * 252.0)
+        # Episodes use roughly 7 hourly trading bars per regular-session day.
+        # Convert bar-hours to trading years consistently with DTE/expiry_t.
+        tau = tau_hours / (7.0 * 252.0)
         vol = max(float(vol), 0.15)
         sqrt_tau = sqrt(tau)
         d1 = (log(max(spot, 1e-9) / max(strike, 1e-9)) + 0.5 * vol * vol * tau) / (vol * sqrt_tau)
