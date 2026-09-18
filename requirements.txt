@@ -10,3 +10,4 @@ SQLAlchemy>=2.0,<3
 requests>=2.32,<3
 httpx>=0.27,<1
 pytest>=8,<9
+sb3-contrib>=2.7,<3
