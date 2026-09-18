@@ -9,6 +9,7 @@ import pandas as pd
 import yfinance as yf
 from sb3_contrib import MaskablePPO
 from sb3_contrib.common.maskable.callbacks import MaskableEvalCallback
+from sb3_contrib.common.maskable.utils import get_action_masks
 from stable_baselines3.common.monitor import Monitor
 
 from app.environment.options_env import CALL, CONTRACT_SIZES, DTE_DAYS, STRIKE_OFFSETS, OptionsTradingEnv
@@ -248,7 +249,8 @@ def evaluate(model, data: pd.DataFrame, report_dir: Path | None = None) -> dict:
     rejected = 0
     invalid_reasons = {}
     while not terminated:
-        action, _ = model.predict(obs, deterministic=True)
+        action_masks = get_action_masks(env)
+        action, _ = model.predict(obs, deterministic=True, action_masks=action_masks)
         action = int(np.asarray(action).item())
         actions.append(action)
         obs, _, terminated, _, info = env.step(action)
