@@ -44,6 +44,10 @@ class RiskManagedPPOEnv(gym.Wrapper):
     def equity(self):
         return self.env.equity
 
+    @property
+    def position(self):
+        return self.env.position
+
     def _decode(self, action: int):
         action = int(np.asarray(action).item())
         if action == 0:
@@ -240,7 +244,7 @@ def evaluate(model, data: pd.DataFrame) -> dict:
         "worst_trade": float(min((t["pnl"] for t in trades), default=0.0)),
         "open_position": env.position is not None,
         "open_position_unrealized_pnl": (
-            float((env._mark(env.t) - env.position.entry_price) * env.multiplier * env.position.contracts)
+            float((env.env._mark(env.env.t) - env.position.entry_price) * env.env.multiplier * env.position.contracts)
             if env.position is not None else 0.0
         ),
         "action_counts": {
