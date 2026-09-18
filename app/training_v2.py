@@ -9,7 +9,7 @@ import pandas as pd
 import yfinance as yf
 from sb3_contrib import MaskablePPO
 from sb3_contrib.common.maskable.callbacks import MaskableEvalCallback
-from stable_baselines3.common.callbacks import CheckpointCallback
+from stable_baselines3.common.callbacks import CallbackList, CheckpointCallback
 from sb3_contrib.common.maskable.utils import get_action_masks
 from stable_baselines3.common.monitor import Monitor
 
@@ -371,7 +371,7 @@ def train(ticker: str, timesteps: int = DEFAULT_TIMESTEPS, period: str = "730d",
         save_path=str(out / "checkpoints"),
         name_prefix=f"ppo_options_{ticker.lower()}",
     )
-    callback = MaskableEvalCallback(
+    eval_callback = MaskableEvalCallback(
         eval_env,
         best_model_save_path=str(best),
         log_path=str(logs),
@@ -379,12 +379,15 @@ def train(ticker: str, timesteps: int = DEFAULT_TIMESTEPS, period: str = "730d",
         n_eval_episodes=1,
         deterministic=True,
         verbose=1,
-        callback_after_eval=checkpoint,
     )
+    callback = CallbackList([checkpoint, eval_callback])
 
     if resume:
         checkpoint_path = out / "checkpoints" / f"ppo_options_{ticker.lower()}_{timesteps}_steps.zip"
-        candidates = sorted((out / "checkpoints").glob(f"ppo_options_{ticker.lower()}_*_steps.zip"))
+        candidates = sorted(
+            (out / "checkpoints").glob(f"ppo_options_{ticker.lower()}_*_steps.zip"),
+            key=lambda p: int(p.stem.rsplit("_", 2)[1]),
+        )
         if candidates:
             checkpoint_path = candidates[-1]
         elif path.with_suffix(".zip").exists():
