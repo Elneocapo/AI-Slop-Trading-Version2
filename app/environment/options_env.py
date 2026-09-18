@@ -214,12 +214,12 @@ class OptionsTradingEnv(gym.Env):
             execution_price = mark * max(1.0 - self.slippage, 0.0)
             proceeds = execution_price * self.multiplier * position.contracts
             self.cash += max(proceeds - self.transaction_cost, 0.0)
-            pnl = (execution_price - position.entry_price) * self.multiplier * position.contracts - self.transaction_cost
+            pnl = (execution_price - position.entry_price) * self.multiplier * position.contracts - (2.0 * self.transaction_cost)
         else:
             execution_price = mark * (1.0 + self.slippage)
             buyback = execution_price * self.multiplier * position.contracts + self.transaction_cost
             self.cash += position.collateral - buyback
-            pnl = (position.entry_price - execution_price) * self.multiplier * position.contracts - self.transaction_cost
+            pnl = (position.entry_price - execution_price) * self.multiplier * position.contracts - (2.0 * self.transaction_cost)
 
         self.trade_log.append({
             "entry_t": position.entry_t,
@@ -244,10 +244,10 @@ class OptionsTradingEnv(gym.Env):
         value = intrinsic * self.multiplier * position.contracts
         if position.kind in (1, -1):
             self.cash += value
-            pnl = (intrinsic - position.entry_price) * self.multiplier * position.contracts
+            pnl = (intrinsic - position.entry_price) * self.multiplier * position.contracts - self.transaction_cost
         else:
             self.cash += position.collateral - value
-            pnl = (position.entry_price - intrinsic) * self.multiplier * position.contracts
+            pnl = (position.entry_price - intrinsic) * self.multiplier * position.contracts - self.transaction_cost
 
         self.trade_log.append({
             "entry_t": position.entry_t,
