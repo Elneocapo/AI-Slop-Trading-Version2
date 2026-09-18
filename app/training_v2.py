@@ -336,19 +336,26 @@ def evaluate(model, data: pd.DataFrame, report_dir: Path | None = None) -> dict:
 
 
 def evaluate_oos_segments(model, oos_data: pd.DataFrame, segments: int = 3) -> list[dict]:
-    """Split the single 145-day OOS period into contiguous segments."""
-    total = len(oos_data) - LOOKBACK
-    segment_steps = total // segments
+    """Split the single 145-day OOS period into contiguous, valid segments."""
+    oos_steps = len(oos_data) - LOOKBACK - 1
+    segment_steps = max(50, oos_steps // segments)
     results = []
+
     for segment_id in range(segments):
         start = LOOKBACK + segment_id * segment_steps
-        end = LOOKBACK + ((segment_id + 1) * segment_steps if segment_id < segments - 1 else total)
-        steps = end - start
+        if start >= len(oos_data) - 1:
+            break
+        requested_steps = segment_steps if segment_id < segments - 1 else oos_steps - segment_id * segment_steps
+        steps = min(requested_steps, len(oos_data) - start - 1)
         if steps < 50:
             continue
-        # Include the endpoint candle because OptionsTradingEnv needs one extra
-        # row after the final step to compute terminal equity/observation.
-        window = oos_data.iloc[start - LOOKBACK:end + 1].reset_index(drop=True)
+
+        window = oos_data.iloc[start - LOOKBACK:start + steps + 1].reset_index(drop=True)
+        max_valid_steps = len(window) - LOOKBACK - 1
+        steps = min(steps, max_valid_steps)
+        if steps < 50:
+            continue
+
         env = RiskManagedPPOEnv(
             OptionsTradingEnv(
                 window,
@@ -369,12 +376,14 @@ def evaluate_oos_segments(model, oos_data: pd.DataFrame, segments: int = 3) -> l
             actions.append(action)
             obs, _, terminated, _, _ = env.step(action)
             curve.append(float(env.equity))
+
         pnls = [float(t["pnl"]) for t in env.trade_log]
         running_peak = np.maximum.accumulate(curve)
         drawdowns = (np.asarray(curve) - running_peak) / running_peak
         buy_hold = (
             float(window["Close"].iloc[LOOKBACK + steps - 1]) / float(window["Close"].iloc[LOOKBACK]) - 1.0
         ) * 100.0
+
         results.append({
             "segment": segment_id + 1,
             "steps": steps,
