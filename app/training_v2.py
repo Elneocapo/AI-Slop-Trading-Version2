@@ -9,6 +9,7 @@ import pandas as pd
 import yfinance as yf
 from sb3_contrib import MaskablePPO
 from sb3_contrib.common.maskable.callbacks import MaskableEvalCallback
+from stable_baselines3.common.callbacks import CheckpointCallback
 from sb3_contrib.common.maskable.utils import get_action_masks
 from stable_baselines3.common.monitor import Monitor
 
@@ -365,6 +366,11 @@ def train(ticker: str, timesteps: int = DEFAULT_TIMESTEPS, period: str = "730d",
     best = out / "best"
     best.mkdir(exist_ok=True)
     path = out / f"ppo_options_{ticker.lower()}"
+    checkpoint = CheckpointCallback(
+        save_freq=10_000,
+        save_path=str(out / "checkpoints"),
+        name_prefix=f"ppo_options_{ticker.lower()}",
+    )
     callback = MaskableEvalCallback(
         eval_env,
         best_model_save_path=str(best),
@@ -373,11 +379,22 @@ def train(ticker: str, timesteps: int = DEFAULT_TIMESTEPS, period: str = "730d",
         n_eval_episodes=1,
         deterministic=True,
         verbose=1,
+        callback_after_eval=checkpoint,
     )
 
     if resume:
-        raise ValueError("--resume is disabled for the new joint Discrete action space. Start a fresh model.")
-    model = MaskablePPO(
+        checkpoint_path = out / "checkpoints" / f"ppo_options_{ticker.lower()}_{timesteps}_steps.zip"
+        candidates = sorted((out / "checkpoints").glob(f"ppo_options_{ticker.lower()}_*_steps.zip"))
+        if candidates:
+            checkpoint_path = candidates[-1]
+        elif path.with_suffix(".zip").exists():
+            checkpoint_path = path.with_suffix(".zip")
+        else:
+            raise FileNotFoundError("No saved checkpoint/model found to resume.")
+        print(f"Resuming from {checkpoint_path}")
+        model = MaskablePPO.load(checkpoint_path, env=train_env, device="auto")
+    else:
+        model = MaskablePPO(
         "MlpPolicy",
         train_env,
         learning_rate=3e-4,
@@ -391,8 +408,11 @@ def train(ticker: str, timesteps: int = DEFAULT_TIMESTEPS, period: str = "730d",
         seed=42,
         device="auto",
     )
-    print(f"Starting NEW joint-action PPO model for {timesteps:,} timesteps.")
-    model.learn(total_timesteps=timesteps, callback=callback, progress_bar=True)
+    if not resume:
+        print(f"Starting NEW joint-action PPO model for {timesteps:,} timesteps.")
+    else:
+        print(f"Continuing training for {timesteps:,} additional timesteps.")
+    model.learn(total_timesteps=timesteps, callback=callback, reset_num_timesteps=not resume, progress_bar=True)
     model.save(path)
 
     report_dir = Path("training_eval") / "latest_oos"
