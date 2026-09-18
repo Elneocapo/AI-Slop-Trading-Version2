@@ -17,13 +17,13 @@ EPISODE_HOURS = 145 * 7
 LOOKBACK = 60
 DEFAULT_TIMESTEPS = 5_000_000
 MAX_TRADE_RISK_PCT = 0.10
-INVALID_ACTION_PENALTY = 0.0005
+INVALID_ACTION_PENALTY = 0.01
+NO_POSITION_CLOSE_PENALTY = 0.002
 
 
 class RiskManagedPPOEnv(gym.Wrapper):
     """Expose a compact joint action space and enforce hard account risk."""
 
-    # 0 HOLD, 1 CLOSE, then one block per option type for OPEN_LONG.
     OPEN_ACTIONS = 2 * len(STRIKE_OFFSETS) * len(DTE_DAYS)
     ACTION_COUNT = 2 + OPEN_ACTIONS
 
@@ -80,20 +80,27 @@ class RiskManagedPPOEnv(gym.Wrapper):
     def _translate(self, action):
         operation, option_type, strike_idx, dte_idx = self._decode(action)
         self.last_rejected = False
+        self.last_invalid_reason = None
 
         if operation == 0:
             return np.array([0, 0, 0, 0, 0], dtype=np.int64)
+
         if operation == 2:
+            if self.env.position is None:
+                self.last_invalid_reason = "close_without_position"
+                return np.array([0, 0, 0, 0, 0], dtype=np.int64)
             return np.array([3, 0, 0, 0, 0], dtype=np.int64)
 
         if self.env.position is not None:
             self.last_rejected = True
+            self.last_invalid_reason = "open_while_position_open"
             return np.array([0, option_type, strike_idx, dte_idx, 0], dtype=np.int64)
 
         equity = max(float(self.env._equity(self.env.t)), 0.0)
         risk_budget = equity * self.max_trade_risk_pct
         if risk_budget <= self.env.transaction_cost:
             self.last_rejected = True
+            self.last_invalid_reason = "risk_budget_too_small"
             return np.array([0, option_type, strike_idx, dte_idx, 0], dtype=np.int64)
 
         spot = float(self.env.prices[self.env.t])
@@ -114,6 +121,7 @@ class RiskManagedPPOEnv(gym.Wrapper):
             fallback = self._cheapest_affordable(option_type, risk_budget)
             if fallback is None:
                 self.last_rejected = True
+                self.last_invalid_reason = "no_affordable_contract"
                 return np.array([0, option_type, strike_idx, dte_idx, 0], dtype=np.int64)
             _, strike_idx, dte_idx = fallback
             allowed_size_idx = 0
@@ -123,10 +131,15 @@ class RiskManagedPPOEnv(gym.Wrapper):
     def step(self, action):
         translated = self._translate(action)
         obs, reward, terminated, truncated, info = self.env.step(translated)
+
         if self.last_rejected:
             reward -= INVALID_ACTION_PENALTY
+        elif self.last_invalid_reason == "close_without_position":
+            reward -= NO_POSITION_CLOSE_PENALTY
+
         info = dict(info)
         info["risk_rejected"] = bool(self.last_rejected)
+        info["invalid_reason"] = self.last_invalid_reason
         info["decoded_action"] = self._decode(action)
         return obs, float(reward), terminated, truncated, info
 
@@ -223,12 +236,16 @@ def evaluate(model, data: pd.DataFrame, report_dir: Path | None = None) -> dict:
     terminated = False
     actions = []
     rejected = 0
+    invalid_reasons = {}
     while not terminated:
         action, _ = model.predict(obs, deterministic=True)
         action = int(np.asarray(action).item())
         actions.append(action)
         obs, _, terminated, _, info = env.step(action)
         rejected += int(info.get("risk_rejected", False))
+        reason = info.get("invalid_reason")
+        if reason:
+            invalid_reasons[reason] = invalid_reasons.get(reason, 0) + 1
 
     trades = list(env.trade_log)
     wins = [t for t in trades if t["pnl"] > 0]
@@ -268,6 +285,7 @@ def evaluate(model, data: pd.DataFrame, report_dir: Path | None = None) -> dict:
             "max_drawdown_pct": float(-info["drawdown"] * 100),
             "best_trade": float(max(trade_pnls, default=0.0)),
             "worst_trade": float(min(trade_pnls, default=0.0)),
+            **{f"invalid_{k}": v for k, v in invalid_reasons.items()},
         }]).to_csv(report_dir / "oos_action_audit.csv", index=False)
 
     return {
@@ -295,6 +313,7 @@ def evaluate(model, data: pd.DataFrame, report_dir: Path | None = None) -> dict:
         ),
         "action_counts": action_counts,
         "risk_rejected": rejected,
+        "invalid_reasons": invalid_reasons,
         "max_entry_notional": max_trade_risk,
     }
 
@@ -375,6 +394,7 @@ def train(ticker: str, timesteps: int = DEFAULT_TIMESTEPS, period: str = "730d",
         f"OPEN_CALL {r['action_counts']['open_call']} | OPEN_PUT {r['action_counts']['open_put']}"
     )
     print(f"Risk-rejected actions: {r['risk_rejected']}")
+    print(f"Invalid-action reasons: {r['invalid_reasons']}")
     print(f"Max entry cost observed: €{r['max_entry_notional']:,.2f}")
     print(f"Open position at test end: {'YES' if r['open_position'] else 'NO'}")
     if r["open_position"]:
