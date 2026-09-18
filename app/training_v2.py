@@ -335,6 +335,60 @@ def evaluate(model, data: pd.DataFrame, report_dir: Path | None = None) -> dict:
     }
 
 
+def evaluate_multiple_windows(model, data: pd.DataFrame) -> list[dict]:
+    """Evaluate the policy on several non-overlapping 145-day windows."""
+    total = EPISODE_HOURS
+    starts = [
+        LOOKBACK,
+        max(LOOKBACK, (len(data) - total) // 2),
+        max(LOOKBACK, len(data) - total - 1),
+    ]
+    results = []
+    for window_id, start in enumerate(dict.fromkeys(starts), start=1):
+        if start + total >= len(data):
+            continue
+        window = data.iloc[start - LOOKBACK:start + total].reset_index(drop=True)
+        env = RiskManagedPPOEnv(
+            OptionsTradingEnv(
+                window,
+                initial_cash=500.0,
+                lookback=LOOKBACK,
+                episode_hours=total,
+                fixed_start=LOOKBACK,
+            )
+        )
+        obs, _ = env.reset(seed=100 + window_id)
+        terminated = False
+        curve = [500.0]
+        actions = []
+        while not terminated:
+            masks = get_action_masks(env)
+            action, _ = model.predict(obs, deterministic=True, action_masks=masks)
+            action = int(np.asarray(action).item())
+            actions.append(action)
+            obs, _, terminated, _, _ = env.step(action)
+            curve.append(float(env.equity))
+        pnls = [float(t["pnl"]) for t in env.trade_log]
+        running_peak = np.maximum.accumulate(curve)
+        drawdowns = (np.asarray(curve) - running_peak) / running_peak
+        buy_hold = (float(window["Close"].iloc[LOOKBACK + total - 1]) / float(window["Close"].iloc[LOOKBACK]) - 1.0) * 100.0
+        results.append({
+            "window": window_id,
+            "final_equity": float(env.equity),
+            "return_pct": float((env.equity / 500.0 - 1.0) * 100.0),
+            "max_drawdown_pct": float(-drawdowns.min() * 100.0),
+            "trades": len(pnls),
+            "win_rate_pct": sum(p > 0 for p in pnls) / len(pnls) * 100.0 if pnls else 0.0,
+            "best_trade": max(pnls, default=0.0),
+            "worst_trade": min(pnls, default=0.0),
+            "buy_hold_return_pct": buy_hold,
+            "hold_actions": sum(a == 0 for a in actions),
+            "close_actions": sum(a == 1 for a in actions),
+            "open_actions": sum(a >= 2 for a in actions),
+        })
+    return results
+
+
 def train(ticker: str, timesteps: int = DEFAULT_TIMESTEPS, period: str = "730d", resume: bool = False) -> Path:
     data = load_hourly_data(ticker, period)
     if len(data) <= EPISODE_HOURS + LOOKBACK + 100:
@@ -486,7 +540,17 @@ def main():
         print(f"Max entry cost observed: €{r['max_entry_notional']:,.2f}")
         print(f"Open position at test end: {'YES' if r['open_position'] else 'NO'}")
         print(f"Risk limit: {MAX_TRADE_RISK_PCT * 100:.0f}% of current equity per new position")
+        windows = evaluate_multiple_windows(model, data)
+        pd.DataFrame(windows).to_csv(Path("training_eval") / "latest_oos" / "oos_multi_window_audit.csv", index=False)
         print("OOS audit files: training_eval\\latest_oos")
+        print("\n=== MULTI-WINDOW OOS CHECK ===")
+        for w in windows:
+            print(
+                f"Window {w['window']}: return {w['return_pct']:.2f}% | "
+                f"buy&hold {w['buy_hold_return_pct']:.2f}% | "
+                f"max DD {w['max_drawdown_pct']:.2f}% | "
+                f"trades {w['trades']} | win rate {w['win_rate_pct']:.2f}%"
+            )
     else:
         train(ticker, a.timesteps, a.period, a.resume)
 
