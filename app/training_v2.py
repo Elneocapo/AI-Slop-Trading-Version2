@@ -72,7 +72,7 @@ class RiskManagedPPOEnv(gym.Wrapper):
         return 1, option_type, strike_idx, dte_idx
 
     def _cheapest_affordable(self, option_type: int, risk_budget: float):
-        spot = float(self.env.prices[self.env.t])
+        spot = float(self.env.prices[decision_t])
         vol = self.env._vol(self.env.t)
         best = None
         for strike_idx, offset in enumerate(STRIKE_OFFSETS):
@@ -108,7 +108,8 @@ class RiskManagedPPOEnv(gym.Wrapper):
             self.last_invalid_reason = "open_while_position_open"
             return np.array([0, option_type, strike_idx, dte_idx, 0], dtype=np.int64)
 
-        equity = max(float(self.env._equity(self.env.t)), 0.0)
+        decision_t = max(self.env.t - 1, 0)
+        equity = max(float(self.env._equity(decision_t)), 0.0)
         risk_budget = equity * self.max_trade_risk_pct
         if risk_budget <= self.env.transaction_cost:
             self.last_rejected = True
@@ -117,9 +118,9 @@ class RiskManagedPPOEnv(gym.Wrapper):
 
         spot = float(self.env.prices[self.env.t])
         strike = max(spot * (1.0 + STRIKE_OFFSETS[strike_idx]), 0.01)
-        expiry_t = min(self.env.t + DTE_DAYS[dte_idx] * 7, self.env.end_t)
+        expiry_t = min(decision_t + DTE_DAYS[dte_idx] * 7, self.env.end_t)
         theoretical = self.env._option_price(
-            spot, strike, expiry_t - self.env.t, self.env._vol(self.env.t), option_type == CALL
+            spot, strike, expiry_t - decision_t, self.env._vol(decision_t), option_type == CALL
         )
         execution_price = theoretical * (1.0 + self.env.slippage)
 
