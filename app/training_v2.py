@@ -588,17 +588,26 @@ def main():
     p.add_argument("--period", default="730d")
     p.add_argument("--resume", action="store_true")
     p.add_argument("--eval-only", action="store_true", help="Evaluate the saved model without training.")
+    p.add_argument("--data-source", choices=["synthetic", "real"], default="synthetic")
+    p.add_argument("--options-file", default="data/nvda_real_options.csv.gz")
     a = p.parse_args()
     ticker = a.ticker.upper()
     if a.eval_only:
         data = load_hourly_data(ticker, a.period)
+        option_panel = load_option_panel(Path(a.options_file)) if a.data_source == "real" else None
         split = len(data) - EPISODE_HOURS - 1
         test_data = data.iloc[split - LOOKBACK:].reset_index(drop=True)
-        model_path = Path("models") / f"ppo_options_{ticker.lower()}.zip"
+        model_suffix = "_real" if a.data_source == "real" else ""
+        model_path = Path("models") / f"ppo_options_{ticker.lower()}{model_suffix}.zip"
         if not model_path.exists():
             raise FileNotFoundError(f"Saved model not found: {model_path}")
         model = MaskablePPO.load(model_path, device="auto")
-        r = evaluate(model, test_data, report_dir=Path("training_eval") / "latest_oos")
+        r = evaluate(
+            model,
+            test_data,
+            report_dir=Path("training_eval") / "latest_oos",
+            option_panel=option_panel,
+        )
         print("\n=== 145-DAY OUT-OF-SAMPLE EVALUATION (SAVED MODEL) ===")
         print(f"Ticker: {ticker}")
         print("Initial capital: €500.00")
@@ -636,7 +645,7 @@ def main():
                 f"contracts {int(trade['contracts'])} | entry €{float(trade['entry_price']):.4f} | "
                 f"exit €{float(trade['exit_price']):.4f} | {trade['reason']}"
             )
-        windows = evaluate_oos_segments(model, test_data)
+        windows = evaluate_oos_segments(model, test_data, option_panel=option_panel)
         pd.DataFrame(windows).to_csv(Path("training_eval") / "latest_oos" / "oos_multi_window_audit.csv", index=False)
         print("OOS audit files: training_eval\\latest_oos")
         print("\n=== OOS SEGMENT CHECK (SAME 145-DAY OOS PERIOD) ===")
@@ -648,7 +657,14 @@ def main():
                 f"trades {w['trades']} | win rate {w['win_rate_pct']:.2f}%"
             )
     else:
-        train(ticker, a.timesteps, a.period, a.resume)
+        train(
+            ticker,
+            a.timesteps,
+            a.period,
+            a.resume,
+            data_source=a.data_source,
+            options_file=a.options_file,
+        )
 
 
 if __name__ == "__main__":
