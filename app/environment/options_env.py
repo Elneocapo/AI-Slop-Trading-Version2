@@ -30,6 +30,8 @@ class Position:
     contracts: int
     collateral: float = 0.0
     entry_t: int = 0
+    symbol: str | None = None
+    expiry_ts: str | None = None
 
 
 class OptionsTradingEnv(gym.Env):
@@ -137,6 +139,31 @@ class OptionsTradingEnv(gym.Env):
         """Map relative strike requests onto a realistic $2.50 strike grid."""
         raw = max(float(spot) * (1.0 + float(offset)), 0.01)
         return max(round(raw / 2.5) * 2.5, 2.5)
+
+    def _get_candidate_contract(self, t: int, option_type: int, strike_idx: int, dte_idx: int) -> dict:
+        """Return the executable candidate contract at the last observed bar."""
+        decision_t = max(int(t) - 1, 0)
+        spot = float(self.prices[decision_t])
+        strike = self._strike_from_offset(spot, STRIKE_OFFSETS[int(strike_idx)])
+        expiry_t = min(decision_t + DTE_DAYS[int(dte_idx)] * 7, self.end_t)
+        mid = self._option_price(
+            spot,
+            strike,
+            expiry_t - decision_t,
+            self._vol(decision_t),
+            int(option_type) == CALL,
+        )
+        bid, ask = self._option_bid_ask(mid)
+        return {
+            "symbol": None,
+            "strike": strike,
+            "expiry_t": int(expiry_t),
+            "expiry_ts": None,
+            "bid": float(bid),
+            "ask": float(ask),
+            "mid": float(mid),
+            "option_type": int(option_type),
+        }
 
     @staticmethod
     def _option_bid_ask(mid: float) -> tuple[float, float]:
@@ -378,12 +405,21 @@ class OptionsTradingEnv(gym.Env):
             for offset in STRIKE_OFFSETS:
                 strike = self._strike_from_offset(spot, offset)
                 for dte_days in DTE_DAYS:
-                    q = self._option_greeks(spot, strike, dte_days * 7, vol, call)
-                    _, ask = self._option_bid_ask(q[0])
-                    candidates.extend([
-                        ask / max(spot, 1e-9), q[1], q[2] * spot,
-                        q[3] / max(spot, 1e-9), q[4] / max(spot, 1e-9),
-                    ])
+                    candidate = self._get_candidate_contract(
+                        self.t,
+                        CALL if call else PUT,
+                        STRIKE_OFFSETS.index(offset),
+                        DTE_DAYS.index(dte_days),
+                    )
+                    tau_hours = max(candidate["expiry_t"] - decision_t, 0)
+                    if candidate["ask"] <= 0.0 or candidate["bid"] < 0.0:
+                        candidates.extend([0.0] * 5)
+                    else:
+                        q = self._option_greeks(spot, candidate["strike"], tau_hours, vol, call)
+                        candidates.extend([
+                            candidate["ask"] / max(spot, 1e-9), q[1], q[2] * spot,
+                            q[3] / max(spot, 1e-9), q[4] / max(spot, 1e-9),
+                        ])
 
         portfolio = [
             self.cash / self.initial_cash,
