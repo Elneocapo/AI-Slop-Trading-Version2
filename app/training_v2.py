@@ -123,7 +123,8 @@ class RiskManagedPPOEnv(gym.Wrapper):
             self.last_invalid_reason = "risk_budget_too_small"
             return np.array([0, option_type, strike_idx, dte_idx, 0], dtype=np.int64)
 
-        spot = float(self.env.prices[self.env.t])
+        # All risk checks use the last bar available to the policy.
+        spot = float(self.env.prices[decision_t])
         strike = self.env._strike_from_offset(spot, STRIKE_OFFSETS[strike_idx])
         expiry_t = min(decision_t + DTE_DAYS[dte_idx] * 7, self.env.end_t)
         theoretical = self.env._option_price(
@@ -145,6 +146,33 @@ class RiskManagedPPOEnv(gym.Wrapper):
                 return np.array([0, option_type, strike_idx, dte_idx, 0], dtype=np.int64)
             _, strike_idx, dte_idx = fallback
             allowed_size_idx = 0
+
+        # Final hard guard: the translated order must never exceed the
+        # absolute risk budget because of rounding or a stale candidate quote.
+        final_contracts = CONTRACT_SIZES[allowed_size_idx]
+        final_strike = self.env._strike_from_offset(
+            spot, STRIKE_OFFSETS[strike_idx]
+        )
+        final_expiry = min(
+            decision_t + DTE_DAYS[dte_idx] * 7,
+            self.env.end_t,
+        )
+        final_theoretical = self.env._option_price(
+            spot,
+            final_strike,
+            final_expiry - decision_t,
+            self.env._vol(decision_t),
+            option_type == CALL,
+        )
+        final_execution = final_theoretical * (1.0 + self.env.slippage)
+        final_required = (
+            final_execution * self.env.multiplier * final_contracts
+            + self.env.transaction_cost
+        )
+        if final_required > risk_budget or final_required > float(self.env.cash):
+            self.last_rejected = True
+            self.last_invalid_reason = "final_risk_guard"
+            return np.array([0, option_type, strike_idx, dte_idx, 0], dtype=np.int64)
 
         return np.array([1, option_type, strike_idx, dte_idx, allowed_size_idx], dtype=np.int64)
 
