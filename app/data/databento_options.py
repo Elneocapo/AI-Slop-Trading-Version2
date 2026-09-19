@@ -138,6 +138,31 @@ def build_real_options_panel(
     definition_start = pd.Timestamp(trade_dates.min(), tz=ET) - pd.Timedelta(days=max(DTE_DAYS) + 15)
     definition_end = pd.Timestamp(trade_dates.max(), tz=ET) + pd.Timedelta(days=1)
 
+    estimated_definition_cost = float(
+        client.metadata.get_cost(
+            dataset=DATASET,
+            symbols=[f"{ticker}.OPT"],
+            schema="definition",
+            start=definition_start,
+            end=definition_end,
+            stype_in="parent",
+        )
+    )
+    if not np.isfinite(estimated_definition_cost) or estimated_definition_cost < 0:
+        raise RuntimeError(
+            f"Databento returned an invalid definition cost estimate: {estimated_definition_cost}"
+        )
+    if estimated_definition_cost > max_cost_usd:
+        raise RuntimeError(
+            "Databento cost guard stopped before downloading option definitions. "
+            f"Estimated definition cost: ${estimated_definition_cost:,.4f}; "
+            f"hard limit: ${max_cost_usd:,.2f}."
+        )
+    print(
+        f"[cost] definitions: ${estimated_definition_cost:,.4f} | "
+        f"remaining quote-data budget ${max_cost_usd - estimated_definition_cost:,.4f}"
+    )
+
     definitions = client.timeseries.get_range(
         dataset=DATASET,
         schema="definition",
@@ -150,7 +175,7 @@ def build_real_options_panel(
         raise RuntimeError(f"No OPRA option definitions returned for {ticker}.")
 
     rows: list[dict] = []
-    estimated_cost_usd = 0.0
+    estimated_cost_usd = estimated_definition_cost
     cost_days = 0
     for trade_date in trade_dates:
         mask = local_dates == trade_date
@@ -253,7 +278,8 @@ def build_real_options_panel(
         raise RuntimeError("No usable historical OPRA quotes were returned.")
     panel = panel.drop_duplicates(["timestamp", "candidate_idx"]).sort_values(["timestamp", "candidate_idx"])
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    panel.to_csv(output_path, index=False)
+    compression = "gzip" if str(output_path).endswith(".gz") else None
+    panel.to_csv(output_path, index=False, compression=compression)
     return output_path
 
 
