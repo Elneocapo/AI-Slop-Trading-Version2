@@ -123,9 +123,23 @@ class OptionsTradingEnv(gym.Env):
     def _norm_pdf(x: float) -> float:
         return exp(-0.5 * x * x) / sqrt(2.0 * np.pi)
 
+    @staticmethod
+    def _round_option_price(price: float) -> float:
+        """Round a synthetic equity-option premium to a valid penny quote."""
+        if not np.isfinite(price):
+            return 0.01
+        return max(round(float(price) / 0.01) * 0.01, 0.01)
+
+    @staticmethod
+    def _strike_from_offset(spot: float, offset: float) -> float:
+        """Map relative strike requests onto a realistic $2.50 strike grid."""
+        raw = max(float(spot) * (1.0 + float(offset)), 0.01)
+        return max(round(raw / 2.5) * 2.5, 2.5)
+
     def _option_price(self, spot: float, strike: float, tau_hours: float, vol: float, call: bool) -> float:
         if tau_hours <= 0:
-            return max(spot - strike, 0.0) if call else max(strike - spot, 0.0)
+            intrinsic = max(spot - strike, 0.0) if call else max(strike - spot, 0.0)
+            return self._round_option_price(intrinsic) if intrinsic > 0 else 0.0
         # Episodes use roughly 7 hourly trading bars per regular-session day.
         # Convert bar-hours to trading years consistently with DTE/expiry_t.
         tau = tau_hours / (7.0 * 252.0)
@@ -134,9 +148,8 @@ class OptionsTradingEnv(gym.Env):
         d2 = d1 - vol * sqrt(tau)
         nd1 = self._norm_cdf(d1)
         nd2 = self._norm_cdf(d2)
-        if call:
-            return spot * nd1 - strike * nd2
-        return strike * (1.0 - nd2) - spot * (1.0 - nd1)
+        theoretical = spot * nd1 - strike * nd2 if call else strike * (1.0 - nd2) - spot * (1.0 - nd1)
+        return self._round_option_price(theoretical)
 
     def _option_greeks(self, spot: float, strike: float, tau_hours: float, vol: float, call: bool) -> tuple[float, float, float, float, float]:
         if tau_hours <= 0:
@@ -181,7 +194,7 @@ class OptionsTradingEnv(gym.Env):
         decision_t = max(self.t - 1, 0)
         spot = float(self.prices[decision_t])
         offset = STRIKE_OFFSETS[int(strike_idx)]
-        strike = max(spot * (1.0 + offset), 0.01)
+        strike = self._strike_from_offset(spot, offset)
         dte_days = DTE_DAYS[int(dte_idx)]
         contracts = CONTRACT_SIZES[int(size_idx)]
         call = int(option_type) == CALL
@@ -344,7 +357,7 @@ class OptionsTradingEnv(gym.Env):
         candidates = []
         for call in (True, False):
             for offset in STRIKE_OFFSETS:
-                strike = max(spot * (1.0 + offset), 0.01)
+                strike = self._strike_from_offset(spot, offset)
                 for dte_days in DTE_DAYS:
                     q = self._option_greeks(spot, strike, dte_days * 7, vol, call)
                     candidates.extend([
