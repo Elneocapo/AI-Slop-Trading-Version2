@@ -136,6 +136,19 @@ class OptionsTradingEnv(gym.Env):
         raw = max(float(spot) * (1.0 + float(offset)), 0.01)
         return max(round(raw / 2.5) * 2.5, 2.5)
 
+    @staticmethod
+    def _option_bid_ask(mid: float) -> tuple[float, float]:
+        """Create a conservative synthetic bid/ask around the BS mid price."""
+        mid = max(float(mid), 0.0)
+        if mid <= 0.0:
+            return 0.0, 0.0
+        # Synthetic full spread: at least $0.02, otherwise 5% of premium.
+        # Round both sides to the $0.01 option tick.
+        spread = max(0.02, mid * 0.05)
+        bid = max(np.floor((mid - spread / 2.0) * 100.0) / 100.0, 0.0)
+        ask = max(np.ceil((mid + spread / 2.0) * 100.0) / 100.0, 0.01)
+        return float(bid), float(ask)
+
     def _option_price(self, spot: float, strike: float, tau_hours: float, vol: float, call: bool) -> float:
         if tau_hours <= 0:
             intrinsic = max(spot - strike, 0.0) if call else max(strike - spot, 0.0)
@@ -205,7 +218,8 @@ class OptionsTradingEnv(gym.Env):
         cost = self.transaction_cost
 
         if operation == OPEN_LONG:
-            execution_price = theoretical * (1.0 + self.slippage)
+            _, ask = self._option_bid_ask(theoretical)
+            execution_price = ask * (1.0 + self.slippage)
             total = execution_price * self.multiplier * contracts + cost
             if total > self.cash:
                 return
@@ -214,7 +228,8 @@ class OptionsTradingEnv(gym.Env):
             kind = 1 if call else -1
             self.position = Position(kind, strike, expiry_t, execution_price, contracts, entry_t=self.t)
         elif operation == OPEN_SHORT:
-            execution_price = theoretical * max(1.0 - self.slippage, 0.0)
+            bid, _ = self._option_bid_ask(theoretical)
+            execution_price = bid * max(1.0 - self.slippage, 0.0)
             collateral = spot * self.multiplier * contracts * 0.50
             premium = execution_price * self.multiplier * contracts
             net_cash_needed = collateral - premium + cost
@@ -233,13 +248,15 @@ class OptionsTradingEnv(gym.Env):
         mark = self._mark(decision_t)
         value = mark * self.multiplier * position.contracts
         if position.kind in (1, -1):
-            execution_price = mark * max(1.0 - self.slippage, 0.0)
+            bid, _ = self._option_bid_ask(mark)
+            execution_price = bid * max(1.0 - self.slippage, 0.0)
             proceeds = execution_price * self.multiplier * position.contracts
             self.cash += proceeds - self.transaction_cost
             self.total_transaction_costs += self.transaction_cost
             pnl = (execution_price - position.entry_price) * self.multiplier * position.contracts - (2.0 * self.transaction_cost)
         else:
-            execution_price = mark * (1.0 + self.slippage)
+            _, ask = self._option_bid_ask(mark)
+            execution_price = ask * (1.0 + self.slippage)
             buyback = execution_price * self.multiplier * position.contracts + self.transaction_cost
             self.cash += position.collateral - buyback
             self.total_transaction_costs += self.transaction_cost
