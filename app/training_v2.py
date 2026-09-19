@@ -577,6 +577,21 @@ def main():
         print(f"Max entry cost observed: €{r['max_entry_notional']:,.2f}")
         print(f"Open position at test end: {'YES' if r['open_position'] else 'NO'}")
         print(f"Risk limit: min({MAX_TRADE_RISK_PCT * 100:.0f}% current equity, {MAX_TRADE_RISK_PCT * 100:.0f}% initial capital) per new position")
+        ranked = sorted(r["trades"], key=lambda t: float(t["pnl"]), reverse=True)
+        print("Top 3 trades:")
+        for trade in ranked[:3]:
+            print(
+                f"  P&L €{float(trade['pnl']):,.2f} | strike {float(trade['strike']):.2f} | "
+                f"contracts {int(trade['contracts'])} | entry €{float(trade['entry_price']):.4f} | "
+                f"exit €{float(trade['exit_price']):.4f} | {trade['reason']}"
+            )
+        print("Bottom 3 trades:")
+        for trade in ranked[-3:]:
+            print(
+                f"  P&L €{float(trade['pnl']):,.2f} | strike {float(trade['strike']):.2f} | "
+                f"contracts {int(trade['contracts'])} | entry €{float(trade['entry_price']):.4f} | "
+                f"exit €{float(trade['exit_price']):.4f} | {trade['reason']}"
+            )
         windows = evaluate_oos_segments(model, test_data)
         pd.DataFrame(windows).to_csv(Path("training_eval") / "latest_oos" / "oos_multi_window_audit.csv", index=False)
         print("OOS audit files: training_eval\\latest_oos")
