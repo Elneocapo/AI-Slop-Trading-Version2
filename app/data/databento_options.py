@@ -99,6 +99,7 @@ def _fetch_quotes(
         dataset=DATASET,
         schema="cbbo-1m",
         stype_in="raw_symbol",
+        stype_out="raw_symbol",
         symbols=symbols,
         start=start,
         end=end,
@@ -310,7 +311,10 @@ def build_real_options_panel(
     )
     panel = pd.DataFrame(rows)
     if panel.empty:
-        raise RuntimeError("No usable historical OPRA quotes were returned.")
+        raise RuntimeError(
+            "No usable historical OPRA quotes were returned after symbol/time matching. "
+            "The request itself succeeded; check contract availability and quote coverage."
+        )
     panel = panel.drop_duplicates(["timestamp", "candidate_idx"]).sort_values(["timestamp", "candidate_idx"])
     output_path.parent.mkdir(parents=True, exist_ok=True)
     compression = "gzip" if str(output_path).endswith(".gz") else None
