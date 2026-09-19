@@ -131,7 +131,8 @@ class RiskManagedPPOEnv(gym.Wrapper):
         theoretical = self.env._option_price(
             spot, strike, expiry_t - decision_t, self.env._vol(decision_t), option_type == CALL
         )
-        execution_price = theoretical * (1.0 + self.env.slippage)
+        _, ask = self.env._option_bid_ask(theoretical)
+        execution_price = ask * (1.0 + self.env.slippage)
 
         allowed_size_idx = None
         for idx, contracts in enumerate(CONTRACT_SIZES):
