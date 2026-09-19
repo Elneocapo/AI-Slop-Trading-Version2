@@ -55,6 +55,28 @@ Tests:
 pytest
 ```
 
+## Historical options data with Alpaca Basic
+
+The RL backtest can use Alpaca's free Indicative historical options data from February 2024 onward. This is not historical OPRA NBBO; the downloader uses 1-hour option bars and creates an explicitly conservative bid/ask proxy from each bar's range.
+
+In PowerShell, after creating an Alpaca account and API keys:
+
+```powershell
+$env:ALPACA_API_KEY="YOUR_KEY"
+$env:ALPACA_SECRET_KEY="YOUR_SECRET"
+
+python -m app.data.alpaca_options --ticker NVDA --period 730d
+python train_ai.py --ticker NVDA --timesteps 100000 --data-source alpaca --options-file data/nvda_alpaca_indicative_options.csv.gz
+```
+
+For a saved-model evaluation only:
+
+```powershell
+python train_ai.py --ticker NVDA --eval-only --data-source alpaca --options-file data/nvda_alpaca_indicative_options.csv.gz
+```
+
+The historical options data is intended for research/backtesting and does not imply live-market execution quality.
+
 The legacy Streamlit dashboard is no longer the primary interface. The desktop app is the supported UI.
 
 ## Desktop UI
