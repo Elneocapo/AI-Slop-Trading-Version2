@@ -39,9 +39,7 @@ def make_env(data, option_panel=None, fixed_start=None, episode_hours=EPISODE_HO
 
 def load_option_panel(path: Path) -> pd.DataFrame:
     if not path.exists():
-        raise FileNotFoundError(
-            f"Real options panel not found: {path}. Run: python -m app.data.databento_options --ticker NVDA --period 730d"
-        )
+        raise FileNotFoundError(f"Options panel not found: {path}")
     return pd.read_csv(path)
 
 
@@ -453,10 +451,10 @@ def evaluate_oos_segments(model, oos_data: pd.DataFrame, option_panel: pd.DataFr
     return results
 
 
-def train(ticker: str, timesteps: int = DEFAULT_TIMESTEPS, period: str = "730d", resume: bool = False, data_source: str = "synthetic", options_file: str = "data/nvda_real_options.csv.gz") -> Path:
+def train(ticker: str, timesteps: int = DEFAULT_TIMESTEPS, period: str = "730d", resume: bool = False, data_source: str = "synthetic", options_file: str = "data/nvda_alpaca_indicative_options.csv.gz") -> Path:
     data = load_hourly_data(ticker, period)
-    option_panel = load_option_panel(Path(options_file)) if data_source == "real" else None
-    model_suffix = "_real" if data_source == "real" else ""
+    option_panel = load_option_panel(Path(options_file)) if data_source in {"real", "alpaca"} else None
+    model_suffix = "_real" if data_source == "real" else "_alpaca" if data_source == "alpaca" else ""
     if len(data) <= EPISODE_HOURS + LOOKBACK + 100:
         raise ValueError("Not enough hourly history for training")
     split = len(data) - EPISODE_HOURS - 1
@@ -482,8 +480,8 @@ def train(ticker: str, timesteps: int = DEFAULT_TIMESTEPS, period: str = "730d",
     out.mkdir(exist_ok=True)
     logs = Path("training_eval")
     logs.mkdir(exist_ok=True)
-    best = out / "best"
-    best.mkdir(exist_ok=True)
+    best = out / "best" / (model_suffix.strip("_") or "synthetic")
+    best.mkdir(parents=True, exist_ok=True)
     path = out / f"ppo_options_{ticker.lower()}{model_suffix}"
     checkpoint = CheckpointCallback(
         save_freq=10_000,
@@ -588,16 +586,16 @@ def main():
     p.add_argument("--period", default="730d")
     p.add_argument("--resume", action="store_true")
     p.add_argument("--eval-only", action="store_true", help="Evaluate the saved model without training.")
-    p.add_argument("--data-source", choices=["synthetic", "real"], default="synthetic")
-    p.add_argument("--options-file", default="data/nvda_real_options.csv.gz")
+    p.add_argument("--data-source", choices=["synthetic", "alpaca", "real"], default="synthetic")
+    p.add_argument("--options-file", default="data/nvda_alpaca_indicative_options.csv.gz")
     a = p.parse_args()
     ticker = a.ticker.upper()
     if a.eval_only:
         data = load_hourly_data(ticker, a.period)
-        option_panel = load_option_panel(Path(a.options_file)) if a.data_source == "real" else None
+        option_panel = load_option_panel(Path(a.options_file)) if a.data_source in {"real", "alpaca"} else None
         split = len(data) - EPISODE_HOURS - 1
         test_data = data.iloc[split - LOOKBACK:].reset_index(drop=True)
-        model_suffix = "_real" if a.data_source == "real" else ""
+        model_suffix = "_real" if a.data_source == "real" else "_alpaca" if a.data_source == "alpaca" else ""
         model_path = Path("models") / f"ppo_options_{ticker.lower()}{model_suffix}.zip"
         if not model_path.exists():
             raise FileNotFoundError(f"Saved model not found: {model_path}")
