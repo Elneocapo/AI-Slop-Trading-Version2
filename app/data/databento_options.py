@@ -15,7 +15,7 @@ from app.training_v2 import DTE_DAYS, LOOKBACK, STRIKE_OFFSETS, load_hourly_data
 ET = ZoneInfo("America/New_York")
 DATASET = "OPRA.PILLAR"
 # Databento bills historical usage in USD; keep the default below the user's €12 budget.
-DEFAULT_MAX_COST_USD = 12.0
+DEFAULT_MAX_COST_USD = 1.0
 
 
 def _option_type(value: object, raw_symbol: object) -> str | None:
@@ -292,7 +292,7 @@ def main() -> None:
         "--max-cost-usd",
         type=float,
         default=DEFAULT_MAX_COST_USD,
-        help="Hard cumulative Databento historical quote-data ceiling in USD (default: $12).",
+        help="Hard cumulative Databento historical quote-data ceiling in USD (default: $1).",
     )
     args = parser.parse_args()
     path = build_real_options_panel(
