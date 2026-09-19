@@ -148,7 +148,7 @@ def build_real_options_panel(
 
     requested_definition_start = (
         pd.Timestamp(trade_dates.min(), tz=ET) - pd.Timedelta(days=max(DTE_DAYS) + 15)
-    ).tz_convert("UTC")
+    ).tz_convert("UTC").floor("D")
     requested_definition_end = (
         pd.Timestamp(trade_dates.max(), tz=ET) + pd.Timedelta(days=1)
     ).tz_convert("UTC")
@@ -268,9 +268,20 @@ def build_real_options_panel(
             if q is None or q.empty:
                 continue
             base = pd.DataFrame({"timestamp": regular_ts})
+            base["timestamp"] = (
+                pd.to_datetime(base["timestamp"], utc=True)
+                .dt.tz_convert(ET)
+                .astype("datetime64[ns, America/New_York]")
+            )
+            quote_frame = q.rename(columns={"ts_recv": "quote_ts"}).copy()
+            quote_frame["quote_ts"] = (
+                pd.to_datetime(quote_frame["quote_ts"], utc=True)
+                .dt.tz_convert(ET)
+                .astype("datetime64[ns, America/New_York]")
+            )
             merged = pd.merge_asof(
                 base.sort_values("timestamp"),
-                q.rename(columns={"ts_recv": "quote_ts"}).sort_values("quote_ts"),
+                quote_frame.sort_values("quote_ts"),
                 left_on="timestamp",
                 right_on="quote_ts",
                 direction="backward",
