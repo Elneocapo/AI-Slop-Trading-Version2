@@ -511,6 +511,22 @@ def train(ticker: str, timesteps: int = DEFAULT_TIMESTEPS, period: str = "730d",
     print(f"Invalid-action reasons: {r['invalid_reasons']}")
     print(f"Max entry cost observed: €{r['max_entry_notional']:,.2f}")
     print(f"Open position at test end: {'YES' if r['open_position'] else 'NO'}")
+    if r["trades"]:
+        ranked = sorted(r["trades"], key=lambda t: float(t["pnl"]), reverse=True)
+        print("\nTop 5 trades by P&L:")
+        for trade in ranked[:5]:
+            print(
+                f"  P&L €{float(trade['pnl']):,.2f} | strike {float(trade['strike']):.2f} | "
+                f"contracts {int(trade['contracts'])} | entry €{float(trade['entry_price']):.4f} | "
+                f"exit €{float(trade['exit_price']):.4f} | reason {trade['reason']}"
+            )
+        print("Bottom 5 trades by P&L:")
+        for trade in ranked[-5:]:
+            print(
+                f"  P&L €{float(trade['pnl']):,.2f} | strike {float(trade['strike']):.2f} | "
+                f"contracts {int(trade['contracts'])} | entry €{float(trade['entry_price']):.4f} | "
+                f"exit €{float(trade['exit_price']):.4f} | reason {trade['reason']}"
+            )
     if r["open_position"]:
         print(f"Open-position unrealized P&L: €{r['open_position_unrealized_pnl']:,.2f}")
     print(f"Risk limit: min({MAX_TRADE_RISK_PCT * 100:.0f}% current equity, {MAX_TRADE_RISK_PCT * 100:.0f}% initial capital) per new position")
