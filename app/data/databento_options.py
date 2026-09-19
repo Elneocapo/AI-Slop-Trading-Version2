@@ -15,7 +15,7 @@ from app.training_v2 import DTE_DAYS, LOOKBACK, STRIKE_OFFSETS, load_hourly_data
 ET = ZoneInfo("America/New_York")
 DATASET = "OPRA.PILLAR"
 # Databento bills historical usage in USD; keep the default below the user's €12 budget.
-DEFAULT_MAX_COST_USD = 1.0
+DEFAULT_MAX_COST_USD = 20.0
 
 
 def _option_type(value: object, raw_symbol: object) -> str | None:
@@ -268,18 +268,17 @@ def build_real_options_panel(
             if q is None or q.empty:
                 continue
             base = pd.DataFrame({"timestamp": regular_ts})
-            base["timestamp"] = pd.to_datetime(
-                base["timestamp"], utc=True
-            ).dt.tz_convert(ET)
+            base["merge_ts_ns"] = (
+                pd.to_datetime(base["timestamp"], utc=True).astype("int64")
+            )
             quote_frame = q.rename(columns={"ts_recv": "quote_ts"}).copy()
-            quote_frame["quote_ts"] = pd.to_datetime(
-                quote_frame["quote_ts"], utc=True
-            ).dt.tz_convert(ET)
+            quote_frame["merge_ts_ns"] = (
+                pd.to_datetime(quote_frame["quote_ts"], utc=True).astype("int64")
+            )
             merged = pd.merge_asof(
-                base.sort_values("timestamp"),
-                quote_frame.sort_values("quote_ts"),
-                left_on="timestamp",
-                right_on="quote_ts",
+                base.sort_values("merge_ts_ns"),
+                quote_frame.sort_values("merge_ts_ns"),
+                on="merge_ts_ns",
                 direction="backward",
             )
             meta = definitions[definitions["raw_symbol"].astype(str) == symbol]
@@ -328,7 +327,7 @@ def main() -> None:
         "--max-cost-usd",
         type=float,
         default=DEFAULT_MAX_COST_USD,
-        help="Hard cumulative Databento historical quote-data ceiling in USD (default: $1).",
+        help="Hard cumulative Databento historical quote-data ceiling in USD (default: $20).",
     )
     args = parser.parse_args()
     path = build_real_options_panel(
