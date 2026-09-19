@@ -6,7 +6,16 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
-from app.environment.options_env import CALL, CLOSE, OPEN_LONG, OPEN_SHORT, Position, OptionsTradingEnv
+from app.environment.options_env import (
+    CALL,
+    CLOSE,
+    DTE_DAYS,
+    OPEN_LONG,
+    OPEN_SHORT,
+    Position,
+    STRIKE_OFFSETS,
+    OptionsTradingEnv,
+)
 
 
 class RealOptionsTradingEnv(OptionsTradingEnv):
@@ -73,7 +82,12 @@ class RealOptionsTradingEnv(OptionsTradingEnv):
     def _get_candidate_contract(self, t: int, option_type: int, strike_idx: int, dte_idx: int) -> dict | None:
         decision_t = max(int(t) - 1, 0)
         timestamp = pd.Timestamp(self.data.loc[decision_t, "timestamp"]).isoformat()
-        candidate_idx = int(option_type) * 54 + int(strike_idx) * 6 + int(dte_idx)
+        per_type = len(STRIKE_OFFSETS) * len(DTE_DAYS)
+        candidate_idx = (
+            int(option_type) * per_type
+            + int(strike_idx) * len(DTE_DAYS)
+            + int(dte_idx)
+        )
         return self._candidate_quotes.get((timestamp, candidate_idx))
 
     def _position_bid_ask(self, t: int) -> tuple[float, float]:
