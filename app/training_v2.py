@@ -14,6 +14,7 @@ from sb3_contrib.common.maskable.utils import get_action_masks
 from stable_baselines3.common.monitor import Monitor
 
 from app.environment.options_env import CALL, CONTRACT_SIZES, DTE_DAYS, STRIKE_OFFSETS, OptionsTradingEnv
+from app.environment.real_options_env import RealOptionsTradingEnv
 
 EPISODE_HOURS = 145 * 7
 LOOKBACK = 60
@@ -21,6 +22,27 @@ DEFAULT_TIMESTEPS = 5_000_000
 MAX_TRADE_RISK_PCT = 0.10
 INVALID_ACTION_PENALTY = 0.01
 NO_POSITION_CLOSE_PENALTY = 0.002
+
+
+def make_env(data, option_panel=None, fixed_start=None, episode_hours=EPISODE_HOURS):
+    env_cls = RealOptionsTradingEnv if option_panel is not None else OptionsTradingEnv
+    kwargs = {
+        "initial_cash": 500.0,
+        "lookback": LOOKBACK,
+        "episode_hours": episode_hours,
+        "fixed_start": fixed_start,
+    }
+    if option_panel is not None:
+        kwargs["option_panel"] = option_panel
+    return env_cls(data, **kwargs)
+
+
+def load_option_panel(path: Path) -> pd.DataFrame:
+    if not path.exists():
+        raise FileNotFoundError(
+            f"Real options panel not found: {path}. Run: python -m app.data.databento_options --ticker NVDA --period 730d"
+        )
+    return pd.read_csv(path)
 
 
 class RiskManagedPPOEnv(gym.Wrapper):
