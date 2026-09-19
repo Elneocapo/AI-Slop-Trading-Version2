@@ -77,7 +77,7 @@ class RiskManagedPPOEnv(gym.Wrapper):
         vol = self.env._vol(decision_t)
         best = None
         for strike_idx, offset in enumerate(STRIKE_OFFSETS):
-            strike = max(spot * (1.0 + offset), 0.01)
+            strike = self.env._strike_from_offset(spot, offset)
             for dte_idx, dte_days in enumerate(DTE_DAYS):
                 expiry_t = min(decision_t + dte_days * 7, self.env.end_t)
                 theoretical = self.env._option_price(
@@ -124,7 +124,7 @@ class RiskManagedPPOEnv(gym.Wrapper):
             return np.array([0, option_type, strike_idx, dte_idx, 0], dtype=np.int64)
 
         spot = float(self.env.prices[self.env.t])
-        strike = max(spot * (1.0 + STRIKE_OFFSETS[strike_idx]), 0.01)
+        strike = self.env._strike_from_offset(spot, STRIKE_OFFSETS[strike_idx])
         expiry_t = min(decision_t + DTE_DAYS[dte_idx] * 7, self.env.end_t)
         theoretical = self.env._option_price(
             spot, strike, expiry_t - decision_t, self.env._vol(decision_t), option_type == CALL
