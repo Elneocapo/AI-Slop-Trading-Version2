@@ -47,6 +47,10 @@ def _select_daily_contracts(
     spot: float,
 ) -> dict[int, str]:
     defs = definitions.copy()
+    if "ts_event" in defs.columns:
+        defs["ts_event"] = pd.to_datetime(defs["ts_event"], utc=True, errors="coerce")
+        cutoff = trade_date.tz_convert("UTC") if trade_date.tzinfo is not None else trade_date.tz_localize(ET).tz_convert("UTC")
+        defs = defs[defs["ts_event"] <= cutoff]
     defs["option_type"] = [
         _option_type(a, b) for a, b in zip(defs["instrument_class"], defs["raw_symbol"])
     ]
