@@ -387,7 +387,7 @@ def evaluate(model, data: pd.DataFrame, report_dir: Path | None = None, option_p
     }
 
 
-def evaluate_oos_segments(model, oos_data: pd.DataFrame, segments: int = 3) -> list[dict]:
+def evaluate_oos_segments(model, oos_data: pd.DataFrame, option_panel: pd.DataFrame | None = None, segments: int = 3) -> list[dict]:
     """Split the single 145-day OOS period into contiguous, valid segments."""
     oos_steps = len(oos_data) - LOOKBACK - 1
     segment_steps = max(50, oos_steps // segments)
@@ -409,10 +409,9 @@ def evaluate_oos_segments(model, oos_data: pd.DataFrame, segments: int = 3) -> l
             continue
 
         env = RiskManagedPPOEnv(
-            OptionsTradingEnv(
+            make_env(
                 window,
-                initial_cash=500.0,
-                lookback=LOOKBACK,
+                option_panel=option_panel,
                 episode_hours=steps,
                 fixed_start=LOOKBACK,
             )
