@@ -186,7 +186,7 @@ def build_real_options_panel(
             if meta.empty:
                 continue
             definition = meta.iloc[-1]
-            expiry = pd.Timestamp(definition["expiration"], tz="UTC").tz_convert(ET)
+            expiry = pd.to_datetime(definition["expiration"], utc=True).tz_convert(ET)
             strike = float(definition["strike_price"])
             option_type = _option_type(definition["instrument_class"], symbol)
             if option_type is None:
