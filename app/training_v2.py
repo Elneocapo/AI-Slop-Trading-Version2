@@ -453,8 +453,10 @@ def evaluate_oos_segments(model, oos_data: pd.DataFrame, option_panel: pd.DataFr
     return results
 
 
-def train(ticker: str, timesteps: int = DEFAULT_TIMESTEPS, period: str = "730d", resume: bool = False) -> Path:
+def train(ticker: str, timesteps: int = DEFAULT_TIMESTEPS, period: str = "730d", resume: bool = False, data_source: str = "synthetic", options_file: str = "data/nvda_real_options.csv.gz") -> Path:
     data = load_hourly_data(ticker, period)
+    option_panel = load_option_panel(Path(options_file)) if data_source == "real" else None
+    model_suffix = "_real" if data_source == "real" else ""
     if len(data) <= EPISODE_HOURS + LOOKBACK + 100:
         raise ValueError("Not enough hourly history for training")
     split = len(data) - EPISODE_HOURS - 1
@@ -463,15 +465,14 @@ def train(ticker: str, timesteps: int = DEFAULT_TIMESTEPS, period: str = "730d",
 
     train_env = Monitor(
         RiskManagedPPOEnv(
-            OptionsTradingEnv(train_data, initial_cash=500.0, lookback=LOOKBACK, episode_hours=EPISODE_HOURS)
+            make_env(train_data, option_panel=option_panel, episode_hours=EPISODE_HOURS)
         )
     )
     eval_env = Monitor(
         RiskManagedPPOEnv(
-            OptionsTradingEnv(
+            make_env(
                 test_data,
-                initial_cash=500.0,
-                lookback=LOOKBACK,
+                option_panel=option_panel,
                 episode_hours=EPISODE_HOURS,
                 fixed_start=LOOKBACK,
             )
@@ -483,11 +484,11 @@ def train(ticker: str, timesteps: int = DEFAULT_TIMESTEPS, period: str = "730d",
     logs.mkdir(exist_ok=True)
     best = out / "best"
     best.mkdir(exist_ok=True)
-    path = out / f"ppo_options_{ticker.lower()}"
+    path = out / f"ppo_options_{ticker.lower()}{model_suffix}"
     checkpoint = CheckpointCallback(
         save_freq=10_000,
         save_path=str(out / "checkpoints"),
-        name_prefix=f"ppo_options_{ticker.lower()}",
+        name_prefix=f"ppo_options_{ticker.lower()}{model_suffix}",
     )
     eval_callback = MaskableEvalCallback(
         eval_env,
@@ -503,7 +504,7 @@ def train(ticker: str, timesteps: int = DEFAULT_TIMESTEPS, period: str = "730d",
     if resume:
         checkpoint_path = out / "checkpoints" / f"ppo_options_{ticker.lower()}_{timesteps}_steps.zip"
         candidates = sorted(
-            (out / "checkpoints").glob(f"ppo_options_{ticker.lower()}_*_steps.zip"),
+            (out / "checkpoints").glob(f"ppo_options_{ticker.lower()}{model_suffix}_*_steps.zip"),
             key=lambda p: int(p.stem.rsplit("_", 2)[1]),
         )
         if candidates:
@@ -537,7 +538,7 @@ def train(ticker: str, timesteps: int = DEFAULT_TIMESTEPS, period: str = "730d",
     model.save(path)
 
     report_dir = Path("training_eval") / "latest_oos"
-    r = evaluate(model, test_data, report_dir=report_dir)
+    r = evaluate(model, test_data, report_dir=report_dir, option_panel=option_panel)
 
     print("\n=== 145-DAY OUT-OF-SAMPLE TEST ===")
     print(f"Ticker: {ticker}\nLookback: {LOOKBACK} hourly candles\nEpisode: {EPISODE_HOURS} hourly steps (~145 trading days)")
