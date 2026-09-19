@@ -54,7 +54,12 @@ class RiskManagedPPOEnv(gym.Wrapper):
         if self.env.position is not None:
             mask[1] = True  # CLOSE is valid only while a position is open.
         else:
-            mask[2:] = True  # OPEN_CALL / OPEN_PUT choices.
+            if getattr(self.env, "real_option_mode", False):
+                decision_t = max(self.env.t - 1, 0)
+                if self.env.is_regular_session(decision_t) and self.env.has_entry_quotes(self.env.t):
+                    mask[2:] = True
+            else:
+                mask[2:] = True  # OPEN_CALL / OPEN_PUT choices.
         return mask
 
     def _decode(self, action: int):
@@ -72,20 +77,19 @@ class RiskManagedPPOEnv(gym.Wrapper):
         return 1, option_type, strike_idx, dte_idx
 
     def _cheapest_affordable(self, option_type: int, risk_budget: float):
-        decision_t = max(self.env.t - 1, 0)
-        spot = float(self.env.prices[decision_t])
-        vol = self.env._vol(decision_t)
         best = None
-        for strike_idx, offset in enumerate(STRIKE_OFFSETS):
-            strike = self.env._strike_from_offset(spot, offset)
-            for dte_idx, dte_days in enumerate(DTE_DAYS):
-                expiry_t = min(decision_t + dte_days * 7, self.env.end_t)
-                theoretical = self.env._option_price(
-                    spot, strike, expiry_t - decision_t, vol, option_type == CALL
+        for strike_idx in range(len(STRIKE_OFFSETS)):
+            for dte_idx in range(len(DTE_DAYS)):
+                candidate = self.env._get_candidate_contract(
+                    self.env.t, option_type, strike_idx, dte_idx
                 )
-                _, ask = self.env._option_bid_ask(theoretical)
-                execution_price = ask * (1.0 + self.env.slippage)
-                required = execution_price * self.env.multiplier + self.env.transaction_cost
+                if candidate is None or candidate["ask"] <= 0:
+                    continue
+                required = (
+                    float(candidate["ask"]) * (1.0 + self.env.slippage)
+                    * self.env.multiplier
+                    + self.env.transaction_cost
+                )
                 if required <= risk_budget and required <= float(self.env.cash):
                     if best is None or required < best[0]:
                         best = (required, strike_idx, dte_idx)
@@ -112,9 +116,6 @@ class RiskManagedPPOEnv(gym.Wrapper):
 
         decision_t = max(self.env.t - 1, 0)
         equity = max(float(self.env._equity(decision_t)), 0.0)
-        # Keep the absolute premium-at-risk bounded for a small account.
-        # Risk may shrink with drawdowns, but it cannot compound without bound
-        # merely because the synthetic account has grown.
         risk_budget = min(
             equity * self.max_trade_risk_pct,
             float(self.env.initial_cash) * self.max_trade_risk_pct,
@@ -124,16 +125,26 @@ class RiskManagedPPOEnv(gym.Wrapper):
             self.last_invalid_reason = "risk_budget_too_small"
             return np.array([0, option_type, strike_idx, dte_idx, 0], dtype=np.int64)
 
-        # All risk checks use the last bar available to the policy.
-        spot = float(self.env.prices[decision_t])
-        strike = self.env._strike_from_offset(spot, STRIKE_OFFSETS[strike_idx])
-        expiry_t = min(decision_t + DTE_DAYS[dte_idx] * 7, self.env.end_t)
-        theoretical = self.env._option_price(
-            spot, strike, expiry_t - decision_t, self.env._vol(decision_t), option_type == CALL
+        candidate = self.env._get_candidate_contract(
+            self.env.t, option_type, strike_idx, dte_idx
         )
-        _, ask = self.env._option_bid_ask(theoretical)
-        execution_price = ask * (1.0 + self.env.slippage)
+        if candidate is None or candidate["ask"] <= 0:
+            fallback = self._cheapest_affordable(option_type, risk_budget)
+            if fallback is None:
+                self.last_rejected = True
+                self.last_invalid_reason = "no_affordable_real_quote"
+                return np.array([0, option_type, strike_idx, dte_idx, 0], dtype=np.int64)
+            _, strike_idx, dte_idx = fallback
+            candidate = self.env._get_candidate_contract(
+                self.env.t, option_type, strike_idx, dte_idx
+            )
 
+        if candidate is None or candidate["ask"] <= 0:
+            self.last_rejected = True
+            self.last_invalid_reason = "candidate_quote_missing"
+            return np.array([0, option_type, strike_idx, dte_idx, 0], dtype=np.int64)
+
+        execution_price = float(candidate["ask"]) * (1.0 + self.env.slippage)
         allowed_size_idx = None
         for idx, contracts in enumerate(CONTRACT_SIZES):
             required = execution_price * self.env.multiplier * contracts + self.env.transaction_cost
@@ -147,28 +158,15 @@ class RiskManagedPPOEnv(gym.Wrapper):
                 self.last_invalid_reason = "no_affordable_contract"
                 return np.array([0, option_type, strike_idx, dte_idx, 0], dtype=np.int64)
             _, strike_idx, dte_idx = fallback
+            candidate = self.env._get_candidate_contract(
+                self.env.t, option_type, strike_idx, dte_idx
+            )
             allowed_size_idx = 0
 
-        # Final hard guard: the translated order must never exceed the
-        # absolute risk budget because of rounding or a stale candidate quote.
         final_contracts = CONTRACT_SIZES[allowed_size_idx]
-        final_strike = self.env._strike_from_offset(
-            spot, STRIKE_OFFSETS[strike_idx]
-        )
-        final_expiry = min(
-            decision_t + DTE_DAYS[dte_idx] * 7,
-            self.env.end_t,
-        )
-        final_theoretical = self.env._option_price(
-            spot,
-            final_strike,
-            final_expiry - decision_t,
-            self.env._vol(decision_t),
-            option_type == CALL,
-        )
-        final_execution = final_theoretical * (1.0 + self.env.slippage)
         final_required = (
-            final_execution * self.env.multiplier * final_contracts
+            float(candidate["ask"]) * (1.0 + self.env.slippage)
+            * self.env.multiplier * final_contracts
             + self.env.transaction_cost
         )
         if final_required > risk_budget or final_required > float(self.env.cash):
