@@ -83,7 +83,8 @@ class RiskManagedPPOEnv(gym.Wrapper):
                 theoretical = self.env._option_price(
                     spot, strike, expiry_t - decision_t, vol, option_type == CALL
                 )
-                execution_price = theoretical * (1.0 + self.env.slippage)
+                _, ask = self.env._option_bid_ask(theoretical)
+                execution_price = ask * (1.0 + self.env.slippage)
                 required = execution_price * self.env.multiplier + self.env.transaction_cost
                 if required <= risk_budget and required <= float(self.env.cash):
                     if best is None or required < best[0]:
