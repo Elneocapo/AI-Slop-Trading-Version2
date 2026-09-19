@@ -167,7 +167,7 @@ class OptionsTradingEnv(gym.Env):
         pdf = self._norm_pdf(d1)
         delta = self._norm_cdf(d1) if call else self._norm_cdf(d1) - 1.0
         gamma = pdf / (max(spot, 1e-9) * vol * sqrt_tau)
-        theta_hour = (-(spot * pdf * vol) / (2.0 * sqrt_tau)) / (24.0 * 252.0)
+        theta_hour = (-(spot * pdf * vol) / (2.0 * sqrt_tau)) / (7.0 * 252.0)
         vega = spot * pdf * sqrt_tau
         return price, delta, gamma, theta_hour, vega
 
