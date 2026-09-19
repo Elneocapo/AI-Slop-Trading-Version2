@@ -51,6 +51,7 @@ class OptionsTradingEnv(gym.Env):
         transaction_cost: float = 0.75,
         slippage: float = 0.0025,
         contract_multiplier: int = 100,
+        max_drawdown_limit: float = 0.25,
     ):
         super().__init__()
         self.data = data.reset_index(drop=True).copy()
@@ -61,6 +62,7 @@ class OptionsTradingEnv(gym.Env):
         self.transaction_cost = float(transaction_cost)
         self.slippage = float(slippage)
         self.multiplier = int(contract_multiplier)
+        self.max_drawdown_limit = float(max_drawdown_limit)
 
         required = ["Open", "High", "Low", "Close", "Volume"]
         missing = [c for c in required if c not in self.data.columns]
@@ -240,12 +242,12 @@ class OptionsTradingEnv(gym.Env):
             kind = 2 if call else -2
             self.position = Position(kind, strike, expiry_t, execution_price, contracts, collateral, self.t)
 
-    def _close(self):
+    def _close(self, mark_t: int | None = None, reason: str = "close"):
         if self.position is None:
             return
         position = self.position
-        decision_t = max(self.t - 1, 0)
-        mark = self._mark(decision_t)
+        mark_t = self.t if mark_t is None else int(mark_t)
+        mark = self._mark(mark_t)
         value = mark * self.multiplier * position.contracts
         if position.kind in (1, -1):
             bid, _ = self._option_bid_ask(mark)
@@ -264,14 +266,14 @@ class OptionsTradingEnv(gym.Env):
 
         self.trade_log.append({
             "entry_t": position.entry_t,
-            "exit_t": self.t,
+            "exit_t": mark_t,
             "kind": position.kind,
             "strike": position.strike,
             "contracts": position.contracts,
             "entry_price": position.entry_price,
             "exit_price": execution_price,
             "pnl": pnl,
-            "reason": "close",
+            "reason": reason,
             "transaction_costs": 2.0 * self.transaction_cost,
         })
         self.position = None
@@ -435,11 +437,22 @@ class OptionsTradingEnv(gym.Env):
         self.equity = self._equity(self.t)
         self.peak_equity = max(self.peak_equity, self.equity)
         drawdown = max(0.0, (self.peak_equity - self.equity) / max(self.peak_equity, 1e-9))
+
+        risk_stop = drawdown >= self.max_drawdown_limit
+        if risk_stop and self.position is not None:
+            self._close(mark_t=self.t, reason="risk_stop")
+            self.equity = self._equity(self.t)
+            drawdown = max(0.0, (self.peak_equity - self.equity) / max(self.peak_equity, 1e-9))
+
         reward = (self.equity - pre_action_equity) / self.initial_cash
         reward -= drawdown * 0.02
         self.previous_equity = self.equity
+        if risk_stop:
+            terminated = True
+
         return self._observation(), float(reward), terminated, False, {
             "equity": self.equity,
             "drawdown": drawdown,
             "trade_count": len(self.trade_log),
+            "risk_stop": risk_stop,
         }
