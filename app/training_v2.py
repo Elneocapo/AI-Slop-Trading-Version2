@@ -292,15 +292,9 @@ def load_hourly_data(ticker: str, period: str = "730d") -> pd.DataFrame:
     return df.dropna().reset_index(drop=True)
 
 
-def evaluate(model, data: pd.DataFrame, report_dir: Path | None = None) -> dict:
+def evaluate(model, data: pd.DataFrame, report_dir: Path | None = None, option_panel: pd.DataFrame | None = None) -> dict:
     env = RiskManagedPPOEnv(
-        OptionsTradingEnv(
-            data,
-            initial_cash=500.0,
-            lookback=LOOKBACK,
-            episode_hours=EPISODE_HOURS,
-            fixed_start=LOOKBACK,
-        )
+        make_env(data, option_panel=option_panel, fixed_start=LOOKBACK, episode_hours=EPISODE_HOURS)
     )
     obs, _ = env.reset(seed=123)
     terminated = False
