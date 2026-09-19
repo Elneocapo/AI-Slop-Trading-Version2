@@ -135,8 +135,30 @@ def build_real_options_panel(
     if max_cost_usd <= 0:
         raise ValueError("max_cost_usd must be greater than 0.")
     client = db.Historical(api_key)
-    definition_start = pd.Timestamp(trade_dates.min(), tz=ET) - pd.Timedelta(days=max(DTE_DAYS) + 15)
-    definition_end = pd.Timestamp(trade_dates.max(), tz=ET) + pd.Timedelta(days=1)
+
+    # Databento availability is schema-specific. Clamp requests to the
+    # currently available exclusive end returned by the metadata API.
+    dataset_range = client.metadata.get_dataset_range(dataset=DATASET)
+    schema_ranges = dataset_range.get("schema", {}) if isinstance(dataset_range, dict) else {}
+    definition_range = schema_ranges.get("definition", dataset_range)
+    quote_range = schema_ranges.get("cbbo-1m", dataset_range)
+    definition_available_start = pd.Timestamp(definition_range["start"], tz="UTC")
+    definition_available_end = pd.Timestamp(definition_range["end"], tz="UTC")
+    quote_available_end = pd.Timestamp(quote_range["end"], tz="UTC")
+
+    requested_definition_start = (
+        pd.Timestamp(trade_dates.min(), tz=ET) - pd.Timedelta(days=max(DTE_DAYS) + 15)
+    ).tz_convert("UTC")
+    requested_definition_end = (
+        pd.Timestamp(trade_dates.max(), tz=ET) + pd.Timedelta(days=1)
+    ).tz_convert("UTC")
+    definition_start = max(requested_definition_start, definition_available_start)
+    definition_end = min(requested_definition_end, definition_available_end)
+
+    if definition_start >= definition_end:
+        raise RuntimeError(
+            "No usable Databento definition range overlaps the requested period."
+        )
 
     estimated_definition_cost = float(
         client.metadata.get_cost(
@@ -194,8 +216,15 @@ def build_real_options_panel(
         if not selected:
             continue
 
-        day_start = pd.Timestamp(trade_date, tz=ET) + pd.Timedelta(hours=9, minutes=30)
-        day_end = pd.Timestamp(trade_date, tz=ET) + pd.Timedelta(hours=16)
+        day_start = (
+            pd.Timestamp(trade_date, tz=ET) + pd.Timedelta(hours=9, minutes=30)
+        ).tz_convert("UTC")
+        requested_day_end = (
+            pd.Timestamp(trade_date, tz=ET) + pd.Timedelta(hours=16)
+        ).tz_convert("UTC")
+        day_end = min(requested_day_end, quote_available_end)
+        if day_start >= day_end:
+            continue
         quote_symbols = sorted(set(selected.values()))
 
         # Metadata pricing is free, so enforce the hard ceiling before any
