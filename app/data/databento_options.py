@@ -268,17 +268,13 @@ def build_real_options_panel(
             if q is None or q.empty:
                 continue
             base = pd.DataFrame({"timestamp": regular_ts})
-            base["timestamp"] = (
-                pd.to_datetime(base["timestamp"], utc=True)
-                .dt.tz_convert(ET)
-                .astype("datetime64[ns, America/New_York]")
-            )
+            base["timestamp"] = pd.to_datetime(
+                base["timestamp"], utc=True
+            ).dt.tz_convert(ET)
             quote_frame = q.rename(columns={"ts_recv": "quote_ts"}).copy()
-            quote_frame["quote_ts"] = (
-                pd.to_datetime(quote_frame["quote_ts"], utc=True)
-                .dt.tz_convert(ET)
-                .astype("datetime64[ns, America/New_York]")
-            )
+            quote_frame["quote_ts"] = pd.to_datetime(
+                quote_frame["quote_ts"], utc=True
+            ).dt.tz_convert(ET)
             merged = pd.merge_asof(
                 base.sort_values("timestamp"),
                 quote_frame.sort_values("quote_ts"),
