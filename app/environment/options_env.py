@@ -377,8 +377,9 @@ class OptionsTradingEnv(gym.Env):
                 strike = self._strike_from_offset(spot, offset)
                 for dte_days in DTE_DAYS:
                     q = self._option_greeks(spot, strike, dte_days * 7, vol, call)
+                    _, ask = self._option_bid_ask(q[0])
                     candidates.extend([
-                        q[0] / max(spot, 1e-9), q[1], q[2] * spot,
+                        ask / max(spot, 1e-9), q[1], q[2] * spot,
                         q[3] / max(spot, 1e-9), q[4] / max(spot, 1e-9),
                     ])
 
@@ -402,10 +403,13 @@ class OptionsTradingEnv(gym.Env):
     def _equity(self, t: int) -> float:
         if self.position is None:
             return self.cash
-        mark = self._mark(t) * self.multiplier * self.position.contracts
+        mid = self._mark(t)
+        bid, ask = self._option_bid_ask(mid)
+        liquidation_price = bid if self.position.kind in (1, -1) else ask
+        value = liquidation_price * self.multiplier * self.position.contracts
         if self.position.kind in (1, -1):
-            return self.cash + mark
-        return self.cash + self.position.collateral - mark
+            return self.cash + value
+        return self.cash + self.position.collateral - value
 
     def step(self, action):
         action = np.asarray(action, dtype=np.int64).reshape(-1)
