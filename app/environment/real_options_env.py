@@ -39,6 +39,7 @@ class RealOptionsTradingEnv(OptionsTradingEnv):
         panel = panel.drop_duplicates(["timestamp_key", "candidate_idx"], keep="last")
 
         self.option_panel = panel
+        self._expiry_cache: dict[str, int | None] = {}
         self._candidate_quotes: dict[tuple[str, int], dict[str, Any]] = {}
         self._symbol_quotes: dict[tuple[str, str], tuple[float, float]] = {}
         for row in panel.itertuples(index=False):
@@ -57,7 +58,6 @@ class RealOptionsTradingEnv(OptionsTradingEnv):
             self._symbol_quotes[(row.timestamp_key, str(row.symbol))] = (float(row.bid), float(row.ask))
 
         self.real_option_mode = True
-        self._expiry_cache: dict[str, int | None] = {}
 
     def _find_expiry_index(self, expiry: pd.Timestamp) -> int | None:
         key = expiry.date().isoformat()
@@ -94,10 +94,8 @@ class RealOptionsTradingEnv(OptionsTradingEnv):
         candidate = self._get_candidate_contract(self.t, option_type, strike_idx, dte_idx)
         if candidate is None or candidate["ask"] <= 0:
             return
-        contracts = int(self.CONTRACT_SIZES[int(size_idx)]) if hasattr(self, "CONTRACT_SIZES") else None
-        if contracts is None:
-            from app.environment.options_env import CONTRACT_SIZES
-            contracts = int(CONTRACT_SIZES[int(size_idx)])
+        from app.environment.options_env import CONTRACT_SIZES
+        contracts = int(CONTRACT_SIZES[int(size_idx)])
         execution_price = candidate["ask"] * (1.0 + self.slippage)
         total = execution_price * self.multiplier * contracts + self.transaction_cost
         if operation == OPEN_LONG:
