@@ -411,10 +411,15 @@ class OptionsTradingEnv(gym.Env):
                         STRIKE_OFFSETS.index(offset),
                         DTE_DAYS.index(dte_days),
                     )
-                    tau_hours = max(candidate["expiry_t"] - decision_t, 0)
-                    if candidate["ask"] <= 0.0 or candidate["bid"] < 0.0:
+                    if (
+                        candidate is None
+                        or candidate["expiry_t"] is None
+                        or candidate["ask"] <= 0.0
+                        or candidate["bid"] < 0.0
+                    ):
                         candidates.extend([0.0] * 5)
                     else:
+                        tau_hours = max(candidate["expiry_t"] - decision_t, 0)
                         q = self._option_greeks(spot, candidate["strike"], tau_hours, vol, call)
                         candidates.extend([
                             candidate["ask"] / max(spot, 1e-9), q[1], q[2] * spot,
