@@ -14,6 +14,8 @@ from app.training_v2 import DTE_DAYS, LOOKBACK, STRIKE_OFFSETS, load_hourly_data
 
 ET = ZoneInfo("America/New_York")
 DATASET = "OPRA.PILLAR"
+# Databento bills historical usage in USD; keep the default below the user's €12 budget.
+DEFAULT_MAX_COST_USD = 12.0
 
 
 def _option_type(value: object, raw_symbol: object) -> str | None:
@@ -116,6 +118,7 @@ def build_real_options_panel(
     period: str,
     output_path: Path,
     api_key: str | None = None,
+    max_cost_usd: float = DEFAULT_MAX_COST_USD,
 ) -> Path:
     api_key = api_key or os.getenv("DATABENTO_API_KEY")
     if not api_key:
@@ -129,6 +132,8 @@ def build_real_options_panel(
     local_dates = pd.Series(timestamps.date, index=underlying.index)
     trade_dates = pd.Index(sorted(local_dates.unique()))
 
+    if max_cost_usd <= 0:
+        raise ValueError("max_cost_usd must be greater than 0.")
     client = db.Historical(api_key)
     definition_start = pd.Timestamp(trade_dates.min(), tz=ET) - pd.Timedelta(days=max(DTE_DAYS) + 15)
     definition_end = pd.Timestamp(trade_dates.max(), tz=ET) + pd.Timedelta(days=1)
@@ -145,6 +150,8 @@ def build_real_options_panel(
         raise RuntimeError(f"No OPRA option definitions returned for {ticker}.")
 
     rows: list[dict] = []
+    estimated_cost_usd = 0.0
+    cost_days = 0
     for trade_date in trade_dates:
         mask = local_dates == trade_date
         day_data = underlying.loc[mask]
@@ -164,7 +171,39 @@ def build_real_options_panel(
 
         day_start = pd.Timestamp(trade_date, tz=ET) + pd.Timedelta(hours=9, minutes=30)
         day_end = pd.Timestamp(trade_date, tz=ET) + pd.Timedelta(hours=16)
-        quotes = _fetch_quotes(client, sorted(set(selected.values())), day_start, day_end)
+        quote_symbols = sorted(set(selected.values()))
+
+        # Metadata pricing is free, so enforce the hard ceiling before any
+        # billable historical quote bytes are requested.
+        estimated_day_cost = float(
+            client.metadata.get_cost(
+                dataset=DATASET,
+                symbols=quote_symbols,
+                schema="cbbo-1m",
+                start=day_start,
+                end=day_end,
+                stype_in="raw_symbol",
+            )
+        )
+        if not np.isfinite(estimated_day_cost) or estimated_day_cost < 0:
+            raise RuntimeError(
+                f"Databento returned an invalid cost estimate for {trade_date}: {estimated_day_cost}"
+            )
+        if estimated_cost_usd + estimated_day_cost > max_cost_usd:
+            raise RuntimeError(
+                "Databento cost guard stopped the download before requesting the next "
+                f"billable batch. Estimated cumulative cost: ${estimated_cost_usd:,.4f}; "
+                f"next batch: ${estimated_day_cost:,.4f}; hard limit: ${max_cost_usd:,.2f}. "
+                "No output panel was written. Reduce --period or narrow the request."
+            )
+        estimated_cost_usd += estimated_day_cost
+        cost_days += 1
+        print(
+            f"[cost] {trade_date}: ${estimated_day_cost:,.4f} | "
+            f"cumulative ${estimated_cost_usd:,.4f} / ${max_cost_usd:,.2f}"
+        )
+
+        quotes = _fetch_quotes(client, quote_symbols, day_start, day_end)
 
         quote_by_symbol = {
             symbol: group for symbol, group in quotes.groupby("symbol", sort=False)
@@ -205,6 +244,10 @@ def build_real_options_panel(
                     "ask": float(ask),
                 })
 
+    print(
+        f"Databento estimated quote-data cost before download batches: "
+        f"${estimated_cost_usd:,.4f} across {cost_days} trading days."
+    )
     panel = pd.DataFrame(rows)
     if panel.empty:
         raise RuntimeError("No usable historical OPRA quotes were returned.")
@@ -219,8 +262,19 @@ def main() -> None:
     parser.add_argument("--ticker", default="NVDA")
     parser.add_argument("--period", default="730d")
     parser.add_argument("--output", default="data/nvda_real_options.csv.gz")
+    parser.add_argument(
+        "--max-cost-usd",
+        type=float,
+        default=DEFAULT_MAX_COST_USD,
+        help="Hard cumulative Databento historical quote-data ceiling in USD (default: $12).",
+    )
     args = parser.parse_args()
-    path = build_real_options_panel(args.ticker.upper(), args.period, Path(args.output))
+    path = build_real_options_panel(
+        args.ticker.upper(),
+        args.period,
+        Path(args.output),
+        max_cost_usd=args.max_cost_usd,
+    )
     print(f"Saved real options panel: {path}")
 
 
