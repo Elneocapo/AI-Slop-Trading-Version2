@@ -22,6 +22,7 @@ DEFAULT_TIMESTEPS = 5_000_000
 MAX_TRADE_RISK_PCT = 0.10
 INVALID_ACTION_PENALTY = 0.01
 NO_POSITION_CLOSE_PENALTY = 0.002
+DRAWDOWN_REWARD_PENALTY = 0.01
 
 
 def make_env(data, option_panel=None, fixed_start=None, episode_hours=EPISODE_HOURS):
@@ -122,19 +123,49 @@ class RiskManagedPPOEnv(gym.Wrapper):
     def position(self):
         return self.env.position
 
+    def _risk_budget(self):
+        decision_t = max(self.env.t - 1, 0)
+        equity = max(float(self.env._equity(decision_t)), 0.0)
+        return min(
+            equity * self.max_trade_risk_pct,
+            float(self.env.initial_cash) * self.max_trade_risk_pct,
+        )
+
+    def _action_affordable(self, action: int) -> bool:
+        """Only expose opens that can actually execute under the hard risk cap."""
+        operation, option_type, strike_idx, dte_idx = self._decode(action)
+        if operation != 1 or self.env.position is not None:
+            return False
+        budget = self._risk_budget()
+        if budget <= self.env.transaction_cost:
+            return False
+        candidate = self.env._get_candidate_contract(
+            self.env.t, option_type, strike_idx, dte_idx
+        )
+        if candidate is None or float(candidate.get("ask", 0.0)) <= 0:
+            return False
+        required = (
+            float(candidate["ask"]) * (1.0 + self.env.slippage)
+            * self.env.multiplier
+            + self.env.transaction_cost
+        )
+        return required <= budget and required <= float(self.env.cash)
+
     def action_masks(self):
-        """Return the state-dependent valid actions for MaskablePPO."""
+        """Return only actions that are valid *and executable*."""
         mask = np.zeros(self.ACTION_COUNT, dtype=bool)
         mask[0] = True  # HOLD is always valid.
         if self.env.position is not None:
             mask[1] = True  # CLOSE is valid only while a position is open.
+        elif getattr(self.env, "real_option_mode", False):
+            decision_t = max(self.env.t - 1, 0)
+            if self.env.is_regular_session(decision_t):
+                for action in range(2, self.ACTION_COUNT):
+                    if self._action_affordable(action):
+                        mask[action] = True
         else:
-            if getattr(self.env, "real_option_mode", False):
-                decision_t = max(self.env.t - 1, 0)
-                if self.env.is_regular_session(decision_t) and self.env.has_entry_quotes(self.env.t):
-                    mask[2:] = True
-            else:
-                mask[2:] = True  # OPEN_CALL / OPEN_PUT choices.
+            for action in range(2, self.ACTION_COUNT):
+                mask[action] = self._action_affordable(action)
         return mask
 
     def _decode(self, action: int):
@@ -191,10 +222,7 @@ class RiskManagedPPOEnv(gym.Wrapper):
 
         decision_t = max(self.env.t - 1, 0)
         equity = max(float(self.env._equity(decision_t)), 0.0)
-        risk_budget = min(
-            equity * self.max_trade_risk_pct,
-            float(self.env.initial_cash) * self.max_trade_risk_pct,
-        )
+        risk_budget = self._risk_budget()
         if risk_budget <= self.env.transaction_cost:
             self.last_rejected = True
             self.last_invalid_reason = "risk_budget_too_small"
@@ -253,7 +281,15 @@ class RiskManagedPPOEnv(gym.Wrapper):
 
     def step(self, action):
         translated = self._translate(action)
+        pre_equity = float(self.env._equity(max(self.env.t - 1, 0)))
         obs, reward, terminated, truncated, info = self.env.step(translated)
+
+        # Use a bounded, risk-aware learning signal. Equity change remains the
+        # primary objective, while drawdown receives a small continuous penalty.
+        post_equity = max(float(self.env.equity), 1e-9)
+        pre_equity = max(pre_equity, 1e-9)
+        reward = float(np.log(post_equity / pre_equity))
+        reward -= float(info.get("drawdown", 0.0)) * DRAWDOWN_REWARD_PENALTY
 
         if self.last_rejected:
             reward -= INVALID_ACTION_PENALTY
@@ -437,6 +473,22 @@ def evaluate(model, data: pd.DataFrame, report_dir: Path | None = None, option_p
         "risk_rejected": rejected,
         "invalid_reasons": invalid_reasons,
         "max_entry_notional": max_trade_risk,
+    }
+
+
+def evaluate_baselines(oos_data: pd.DataFrame) -> dict:
+    """Compute simple non-RL reference returns for the exact OOS window."""
+    start = LOOKBACK
+    end = min(len(oos_data) - 1, LOOKBACK + EPISODE_HOURS)
+    start_price = float(oos_data["Close"].iloc[start])
+    end_price = float(oos_data["Close"].iloc[end])
+    buy_hold = (end_price / start_price - 1.0) * 100.0
+
+    # Cash benchmark is the reference for an options account with no trades.
+    return {
+        "cash_final": 500.0,
+        "cash_return_pct": 0.0,
+        "underlying_buy_hold_return_pct": float(buy_hold),
     }
 
 
@@ -629,6 +681,9 @@ def train(ticker: str, timesteps: int = DEFAULT_TIMESTEPS, period: str = "730d",
     if r["open_position"]:
         print(f"Open-position unrealized P&L: €{r['open_position_unrealized_pnl']:,.2f}")
     print(f"Risk limit: min({MAX_TRADE_RISK_PCT * 100:.0f}% current equity, {MAX_TRADE_RISK_PCT * 100:.0f}% initial capital) per new position")
+    baselines = evaluate_baselines(test_data)
+    print(f"Baseline cash return: {baselines['cash_return_pct']:.2f}%")
+    print(f"Underlying buy&hold return: {baselines['underlying_buy_hold_return_pct']:.2f}%")
     print(f"OOS audit files: {report_dir}")
     print("No closed trades recorded in the out-of-sample test." if not r["trades"] else "Trade log recorded.")
     print(f"Model saved: {path}.zip")
@@ -687,6 +742,9 @@ def main():
         print(f"Max entry cost observed: €{r['max_entry_notional']:,.2f}")
         print(f"Open position at test end: {'YES' if r['open_position'] else 'NO'}")
         print(f"Risk limit: min({MAX_TRADE_RISK_PCT * 100:.0f}% current equity, {MAX_TRADE_RISK_PCT * 100:.0f}% initial capital) per new position")
+        baselines = evaluate_baselines(test_data)
+        print(f"Baseline cash return: {baselines['cash_return_pct']:.2f}%")
+        print(f"Underlying buy&hold return: {baselines['underlying_buy_hold_return_pct']:.2f}%")
         ranked = sorted(r["trades"], key=lambda t: float(t["pnl"]), reverse=True)
         print("Top 3 trades:")
         for trade in ranked[:3]:
