@@ -16,7 +16,7 @@ from app.training_v2 import DTE_DAYS, LOOKBACK, STRIKE_OFFSETS, load_hourly_data
 
 ET = ZoneInfo("America/New_York")
 DATASET = "OPRA.PILLAR"
-# Databento bills historical usage in USD; keep the default below the user's €12 budget.
+# Databento bills historical usage in USD; the hard program limit is $20.
 DEFAULT_MAX_COST_USD = 20.0
 
 
@@ -486,6 +486,11 @@ def build_real_options_panel(
     max_cost_usd: float = DEFAULT_MAX_COST_USD,
     cache_dir: Path | None = None,
 ) -> Path:
+    # Once the processed panel exists locally, this path is completely offline.
+    if output_path.exists() and output_path.stat().st_size > 0:
+        print(f"[cache] Using existing local panel: {output_path}")
+        return output_path
+
     api_key = api_key or os.getenv("DATABENTO_API_KEY")
     if not api_key:
         raise RuntimeError(
