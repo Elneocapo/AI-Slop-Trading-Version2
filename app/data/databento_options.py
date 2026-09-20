@@ -89,7 +89,6 @@ def _select_daily_contracts(
     return selected
 
 
-
 def _effective_definition(
     definitions: pd.DataFrame,
     raw_symbol: str,
@@ -391,7 +390,6 @@ def build_real_options_panel(
                 start=quote_start,
                 end=quote_end,
                 stype_in="raw_symbol",
-                stype_out="instrument_id",
             )
         )
         if not np.isfinite(estimated_quote_cost) or estimated_quote_cost < 0:
