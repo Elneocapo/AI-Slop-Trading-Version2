@@ -95,11 +95,12 @@ def _fetch_quotes(
 ) -> pd.DataFrame:
     if not symbols:
         return pd.DataFrame()
+    # Raw-symbol input is supported; Databento returns instrument_id by
+    # default, which is the valid raw_symbol -> instrument_id combination.
     data = client.timeseries.get_range(
         dataset=DATASET,
         schema="cbbo-1m",
         stype_in="raw_symbol",
-        stype_out="raw_symbol",
         symbols=symbols,
         start=start,
         end=end,
@@ -108,10 +109,19 @@ def _fetch_quotes(
     if df.empty:
         return df
     df["ts_recv"] = pd.to_datetime(df["ts_recv"], utc=True).dt.tz_convert(ET)
+    df["instrument_id"] = pd.to_numeric(df["instrument_id"], errors="coerce").astype("Int64")
     df["bid"] = pd.to_numeric(df["bid_px_00"], errors="coerce")
     df["ask"] = pd.to_numeric(df["ask_px_00"], errors="coerce")
-    df = df[(df["bid"] >= 0) & (df["ask"] > 0) & (df["ask"] >= df["bid"])]
-    return df[["ts_recv", "symbol", "bid", "ask"]].sort_values(["symbol", "ts_recv"])
+    df = df[
+        df["instrument_id"].notna()
+        & (df["bid"] >= 0)
+        & (df["ask"] > 0)
+        & (df["ask"] >= df["bid"])
+    ]
+    df["instrument_id"] = df["instrument_id"].astype(int)
+    return df[["ts_recv", "instrument_id", "bid", "ask"]].sort_values(
+        ["instrument_id", "ts_recv"]
+    )
 
 
 def build_real_options_panel(
@@ -260,14 +270,39 @@ def build_real_options_panel(
 
         quotes = _fetch_quotes(client, quote_symbols, day_start, day_end)
 
-        quote_by_symbol = {
-            symbol: group for symbol, group in quotes.groupby("symbol", sort=False)
-        } if not quotes.empty else {}
+        quote_by_instrument = (
+            {
+                int(instrument_id): group
+                for instrument_id, group in quotes.groupby("instrument_id", sort=False)
+            }
+            if not quotes.empty
+            else {}
+        )
 
         for candidate_idx, symbol in selected.items():
-            q = quote_by_symbol.get(symbol)
+            meta = definitions[
+                definitions["raw_symbol"].astype(str) == symbol
+            ].copy()
+            if meta.empty or "instrument_id" not in meta.columns:
+                continue
+            if "ts_event" in meta.columns:
+                meta["ts_event"] = pd.to_datetime(
+                    meta["ts_event"], utc=True, errors="coerce"
+                )
+                effective = meta.dropna(subset=["ts_event"]).sort_values("ts_event")
+                definition = effective.iloc[-1] if not effective.empty else meta.iloc[-1]
+            else:
+                definition = meta.iloc[-1]
+
+            instrument_id = pd.to_numeric(
+                definition["instrument_id"], errors="coerce"
+            )
+            if not np.isfinite(instrument_id):
+                continue
+            q = quote_by_instrument.get(int(instrument_id))
             if q is None or q.empty:
                 continue
+
             base = pd.DataFrame({"timestamp": regular_ts})
             base["merge_ts_ns"] = (
                 pd.to_datetime(base["timestamp"], utc=True).astype("int64")
@@ -282,10 +317,6 @@ def build_real_options_panel(
                 on="merge_ts_ns",
                 direction="backward",
             )
-            meta = definitions[definitions["raw_symbol"].astype(str) == symbol]
-            if meta.empty:
-                continue
-            definition = meta.iloc[-1]
             expiry = pd.to_datetime(definition["expiration"], utc=True).tz_convert(ET)
             strike = float(definition["strike_price"])
             option_type = _option_type(definition["instrument_class"], symbol)
