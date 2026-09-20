@@ -207,11 +207,17 @@ def build_real_options_panel(
     api_key: str | None = None,
     max_cost_usd: float = DEFAULT_MAX_COST_USD,
     cache_dir: Path | None = None,
+    force_rebuild: bool = False,
 ) -> Path:
-    # Once the processed panel exists locally, this path is completely offline.
+    # Reuse the processed panel by default. A forced rebuild is useful after
+    # changing preprocessing logic while keeping the downloaded OPRA batch.
     if output_path.exists() and output_path.stat().st_size > 0:
-        print(f"[cache] Using existing local panel: {output_path}")
-        return output_path
+        if not force_rebuild:
+            print(f"[cache] Using existing local panel: {output_path}")
+            return output_path
+        print(
+            f"[cache] Rebuilding local panel from cached OPRA data: {output_path}"
+        )
 
     api_key = api_key or os.getenv("DATABENTO_API_KEY")
     if not api_key:
@@ -660,12 +666,21 @@ def main() -> None:
         default=DEFAULT_MAX_COST_USD,
         help="Hard cumulative Databento historical quote-data ceiling in USD (default: $20).",
     )
+    parser.add_argument(
+        "--force-rebuild",
+        action="store_true",
+        help=(
+            "Rebuild the processed panel from the existing local Databento "
+            "batch without submitting a new data request."
+        ),
+    )
     args = parser.parse_args()
     path = build_real_options_panel(
         args.ticker.upper(),
         args.period,
         Path(args.output),
         max_cost_usd=args.max_cost_usd,
+        force_rebuild=args.force_rebuild,
     )
     print(f"Saved real options panel: {path}")
 
