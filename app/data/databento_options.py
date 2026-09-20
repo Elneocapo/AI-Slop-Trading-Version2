@@ -440,75 +440,99 @@ def build_real_options_panel(
     )
     manifest = _load_json_manifest(manifest_path)
 
-    if manifest and manifest.get("job_id"):
-        job_id = str(manifest["job_id"])
-        print(f"[cache] Reusing Databento batch job: {job_id}")
-        details = client.batch.get_job_details(job_id)
-        state = str(details.get("state", "")).lower()
-        if state != "done":
-            details = _wait_for_batch_job(client, job_id)
-
+    if manifest and (manifest.get("job_ids") or manifest.get("job_id")):
+        job_ids = [str(x) for x in manifest.get("job_ids", [manifest.get("job_id")])]
         local_data_files = [
             path for path in raw_dir.rglob("*")
             if path.is_file()
             and (path.name.endswith(".csv") or path.name.endswith(".csv.zst"))
         ]
         if not local_data_files:
-            client.batch.download(
-                job_id=job_id,
-                output_dir=raw_dir,
-                keep_zip=False,
-            )
-            print(f"[cache] Downloaded cached batch into {raw_dir}")
+            for chunk_number, job_id in enumerate(job_ids, start=1):
+                print(f"[cache] Reusing Databento batch {chunk_number}/{len(job_ids)}: {job_id}")
+                details = client.batch.get_job_details(job_id)
+                state = str(details.get("state", "")).lower()
+                if state != "done":
+                    details = _wait_for_batch_job(client, job_id)
+                client.batch.download(
+                    job_id=job_id,
+                    output_dir=raw_dir / f"job_{chunk_number}",
+                    keep_zip=False,
+                )
+                print(f"[cache] Downloaded cached batch {chunk_number}/{len(job_ids)}")
     else:
         symbols = sorted(all_symbols)
-        estimated_quote_cost = float(
-            client.metadata.get_cost(
-                dataset=DATASET,
-                symbols=symbols,
-                schema="cbbo-1m",
-                start=quote_start,
-                end=quote_end,
-                stype_in="raw_symbol",
+        # Databento limits a single historical cost query and batch request
+        # to 2,000 symbols. Split large yearly selections into bounded jobs.
+        symbol_chunks = [
+            symbols[i:i + 2000] for i in range(0, len(symbols), 2000)
+        ]
+        estimated_quote_cost = 0.0
+        chunk_costs = []
+        for chunk_number, chunk in enumerate(symbol_chunks, start=1):
+            chunk_cost = float(
+                client.metadata.get_cost(
+                    dataset=DATASET,
+                    symbols=chunk,
+                    schema="cbbo-1m",
+                    start=quote_start,
+                    end=quote_end,
+                    stype_in="raw_symbol",
+                )
             )
-        )
-        if not np.isfinite(estimated_quote_cost) or estimated_quote_cost < 0:
-            raise RuntimeError(
-                f"Invalid Databento quote cost estimate: {estimated_quote_cost}"
+            if not np.isfinite(chunk_cost) or chunk_cost < 0:
+                raise RuntimeError(
+                    f"Invalid Databento quote cost estimate for chunk {chunk_number}: "
+                    f"{chunk_cost}"
+                )
+            estimated_quote_cost += chunk_cost
+            chunk_costs.append(chunk_cost)
+            print(
+                f"[cost] chunk {chunk_number}/{len(symbol_chunks)}: "
+                f"{len(chunk):,} contracts | {chunk_cost:.4f} USD"
             )
 
         estimated_total = definition_cost_usd + estimated_quote_cost
         print(
-            f"[cost] one OPRA batch: {len(symbols):,} contracts | "
-            f"quotes {estimated_quote_cost:.4f} USD | "
+            f"[cost] {len(symbol_chunks)} OPRA batches | "
+            f"{len(symbols):,} contracts | quotes {estimated_quote_cost:.4f} USD | "
             f"estimated total {estimated_total:.4f} / {max_cost_usd:.2f} USD"
         )
         if estimated_total > max_cost_usd:
             raise RuntimeError(
-                "Databento cost guard stopped before the batch was submitted. "
+                "Databento cost guard stopped before the batches were submitted. "
                 f"Definitions {definition_cost_usd:.4f} USD + "
                 f"quotes {estimated_quote_cost:.4f} USD = "
                 f"{estimated_total:.4f} USD, above the {max_cost_usd:.2f} USD limit."
             )
 
-        job = client.batch.submit_job(
-            dataset=DATASET,
-            symbols=symbols,
-            schema="cbbo-1m",
-            start=quote_start,
-            end=quote_end,
-            encoding="csv",
-            compression="zstd",
-            pretty_px=True,
-            pretty_ts=True,
-            map_symbols=True,
-            split_duration="day",
-            stype_in="raw_symbol",
-            stype_out="instrument_id",
-        )
-        job_id = str(job["id"])
+        job_ids = []
+        for chunk_number, chunk in enumerate(symbol_chunks, start=1):
+            print(
+                f"[batch] Submitting chunk {chunk_number}/{len(symbol_chunks)} "
+                f"({len(chunk):,} contracts)"
+            )
+            job = client.batch.submit_job(
+                dataset=DATASET,
+                symbols=chunk,
+                schema="cbbo-1m",
+                start=quote_start,
+                end=quote_end,
+                encoding="csv",
+                compression="zstd",
+                pretty_px=True,
+                pretty_ts=True,
+                map_symbols=True,
+                split_duration="day",
+                stype_in="raw_symbol",
+                stype_out="instrument_id",
+            )
+            job_id = str(job["id"])
+            job_ids.append(job_id)
+            print(f"[batch] Submitted: {job_id}")
+
         manifest = {
-            "job_id": job_id,
+            "job_ids": job_ids,
             "ticker": ticker,
             "period": period,
             "symbols": symbols,
@@ -516,6 +540,7 @@ def build_real_options_panel(
             "quote_end": quote_end.isoformat(),
             "estimated_definition_cost_usd": definition_cost_usd,
             "estimated_quote_cost_usd": estimated_quote_cost,
+            "estimated_chunk_costs_usd": chunk_costs,
             "estimated_total_cost_usd": estimated_total,
             "max_cost_usd": max_cost_usd,
             "dataset": DATASET,
@@ -525,23 +550,30 @@ def build_real_options_panel(
             "cache_dir": str(raw_dir),
         }
         _save_json_manifest(manifest_path, manifest)
-        print(f"[batch] Submitted: {job_id}")
 
-        details = _wait_for_batch_job(client, job_id)
-        actual_cost = details.get("cost_usd")
-        if actual_cost is not None:
-            actual_cost = float(actual_cost)
-            print(f"[batch] Actual batch cost: {actual_cost:.4f} USD")
-        manifest["actual_batch_cost_usd"] = actual_cost
+        actual_cost_total = 0.0
+        for chunk_number, job_id in enumerate(job_ids, start=1):
+            details = _wait_for_batch_job(client, job_id)
+            actual_cost = details.get("cost_usd")
+            if actual_cost is not None:
+                actual_cost = float(actual_cost)
+                actual_cost_total += actual_cost
+                print(
+                    f"[batch] Chunk {chunk_number}/{len(job_ids)} actual cost: "
+                    f"{actual_cost:.4f} USD"
+                )
+            raw_dir.mkdir(parents=True, exist_ok=True)
+            client.batch.download(
+                job_id=job_id,
+                output_dir=raw_dir / f"job_{chunk_number}",
+                keep_zip=False,
+            )
+            print(
+                f"[cache] Raw batch chunk {chunk_number} saved locally"
+            )
+
+        manifest["actual_batch_cost_usd"] = actual_cost_total
         _save_json_manifest(manifest_path, manifest)
-
-        raw_dir.mkdir(parents=True, exist_ok=True)
-        client.batch.download(
-            job_id=job_id,
-            output_dir=raw_dir,
-            keep_zip=False,
-        )
-        print(f"[cache] Raw batch saved locally in {raw_dir}")
 
     raw_df = _read_batch_data_files(raw_dir)
     required = {"symbol", "ts_recv", "bid_px_00", "ask_px_00"}
