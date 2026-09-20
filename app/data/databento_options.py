@@ -134,18 +134,17 @@ def _fetch_quotes(
     if df.empty:
         return df
     df["ts_recv"] = pd.to_datetime(df["ts_recv"], utc=True).dt.tz_convert(ET)
-    df["instrument_id"] = pd.to_numeric(df["instrument_id"], errors="coerce").astype("Int64")
+    df["symbol"] = df["symbol"].astype(str)
     df["bid"] = pd.to_numeric(df["bid_px_00"], errors="coerce")
     df["ask"] = pd.to_numeric(df["ask_px_00"], errors="coerce")
     df = df[
-        df["instrument_id"].notna()
+        df["symbol"].isin(symbols)
         & (df["bid"] >= 0)
         & (df["ask"] > 0)
         & (df["ask"] >= df["bid"])
     ]
-    df["instrument_id"] = df["instrument_id"].astype(int)
-    return df[["ts_recv", "instrument_id", "bid", "ask"]].sort_values(
-        ["instrument_id", "ts_recv"]
+    return df[["ts_recv", "symbol", "bid", "ask"]].sort_values(
+        ["symbol", "ts_recv"]
     )
 
 
@@ -295,10 +294,10 @@ def build_real_options_panel(
 
         quotes = _fetch_quotes(client, quote_symbols, day_start, day_end)
 
-        quote_by_instrument = (
+        quote_by_symbol = (
             {
-                int(instrument_id): group
-                for instrument_id, group in quotes.groupby("instrument_id", sort=False)
+                str(symbol): group
+                for symbol, group in quotes.groupby("symbol", sort=False)
             }
             if not quotes.empty
             else {}
@@ -310,15 +309,10 @@ def build_real_options_panel(
                 symbol,
                 pd.Timestamp(trade_date, tz=ET),
             )
-            if definition is None or "instrument_id" not in definition:
+            if definition is None:
                 continue
 
-            instrument_id = pd.to_numeric(
-                definition["instrument_id"], errors="coerce"
-            )
-            if not np.isfinite(instrument_id):
-                continue
-            q = quote_by_instrument.get(int(instrument_id))
+            q = quote_by_symbol.get(str(symbol))
             if q is None or q.empty:
                 continue
 
