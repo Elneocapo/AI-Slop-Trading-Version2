@@ -490,7 +490,7 @@ def evaluate_oos_segments(model, oos_data: pd.DataFrame, option_panel: pd.DataFr
     return results
 
 
-def train(ticker: str, timesteps: int = DEFAULT_TIMESTEPS, period: str = "730d", resume: bool = False, data_source: str = "synthetic", options_file: str = "data/nvda_alpaca_indicative_options.csv.gz") -> Path:
+def train(ticker: str, timesteps: int = DEFAULT_TIMESTEPS, period: str = "730d", resume: bool = False, data_source: str = "real", options_file: str = "data/nvda_real_options.csv.gz") -> Path:
     data = load_hourly_data(ticker, period)
     option_panel = load_option_panel(Path(options_file)) if data_source in {"real", "alpaca"} else None
     model_suffix = "_real" if data_source == "real" else "_alpaca" if data_source == "alpaca" else ""
@@ -627,8 +627,8 @@ def main():
     p.add_argument("--period", default="730d")
     p.add_argument("--resume", action="store_true")
     p.add_argument("--eval-only", action="store_true", help="Evaluate the saved model without training.")
-    p.add_argument("--data-source", choices=["synthetic", "alpaca", "real"], default="synthetic")
-    p.add_argument("--options-file", default="data/nvda_alpaca_indicative_options.csv.gz")
+    p.add_argument("--data-source", choices=["synthetic", "alpaca", "real"], default="real", help="Options data source (default: real OPRA panel).")
+    p.add_argument("--options-file", default="data/nvda_real_options.csv.gz", help="Real/alpaca options panel path.")
     a = p.parse_args()
     ticker = a.ticker.upper()
     if a.eval_only:
