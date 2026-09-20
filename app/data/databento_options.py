@@ -54,47 +54,74 @@ def _normalize_option_expiration(values: pd.Series) -> pd.Series:
     return (dates + pd.Timedelta(hours=16)).dt.tz_convert(ET)
 
 
+def _prepare_definitions(definitions: pd.DataFrame) -> pd.DataFrame:
+    """Normalize the large definition cache once, not once per trading day."""
+    defs = definitions.copy()
+    if "ts_event" in defs.columns:
+        defs["ts_event"] = pd.to_datetime(
+            defs["ts_event"], utc=True, errors="coerce"
+        )
+    defs["option_type"] = [
+        _option_type(a, b)
+        for a, b in zip(defs["instrument_class"], defs["raw_symbol"])
+    ]
+    defs["expiration"] = _normalize_option_expiration(defs["expiration"])
+    defs["strike_price"] = pd.to_numeric(defs["strike_price"], errors="coerce")
+    return defs[
+        defs["option_type"].isin(["CALL", "PUT"])
+        & defs["raw_symbol"].notna()
+        & defs["expiration"].notna()
+        & defs["strike_price"].notna()
+    ].copy()
+
+
 def _select_daily_contracts(
     definitions: pd.DataFrame,
     trade_date: pd.Timestamp,
     spot: float,
 ) -> dict[int, str]:
-    defs = definitions.copy()
-    if "ts_event" in defs.columns:
-        defs["ts_event"] = pd.to_datetime(defs["ts_event"], utc=True, errors="coerce")
-        cutoff = trade_date.tz_convert("UTC") if trade_date.tzinfo is not None else trade_date.tz_localize(ET).tz_convert("UTC")
-        defs = defs[defs["ts_event"] <= cutoff]
-    defs["option_type"] = [
-        _option_type(a, b) for a, b in zip(defs["instrument_class"], defs["raw_symbol"])
-    ]
-    defs = defs[defs["option_type"].isin(["CALL", "PUT"])]
-    defs["expiration"] = _normalize_option_expiration(defs["expiration"])
-    defs["strike_price"] = pd.to_numeric(defs["strike_price"], errors="coerce")
-    defs = defs.dropna(subset=["expiration", "strike_price", "raw_symbol"])
-
     day = trade_date.date()
-    dte = (defs["expiration"].dt.date - day).map(lambda x: x.days)
+    defs = definitions
+    if "ts_event" in defs.columns:
+        cutoff = trade_date.tz_convert("UTC")
+        defs = defs[(defs["ts_event"].isna()) | (defs["ts_event"] <= cutoff)]
+    if defs.empty:
+        return {}
+
+    dte = (defs["expiration"].dt.tz_convert(ET).dt.date - day).map(
+        lambda value: value.days
+    )
     defs = defs[(dte >= 1) & (dte <= max(DTE_DAYS) + 7)]
     if defs.empty:
         return {}
 
     selected: dict[int, str] = {}
+    normalized_spot = max(float(spot), 1.0)
     for option_type_idx, option_type in enumerate(["CALL", "PUT"]):
         typed = defs[defs["option_type"] == option_type]
+        if typed.empty:
+            continue
+        typed_dte = dte.loc[typed.index]
         for strike_idx, offset in enumerate(STRIKE_OFFSETS):
             target_strike = spot * (1.0 + offset)
+            strike_distance = (
+                typed["strike_price"] - target_strike
+            ).abs() / normalized_spot
             for dte_idx, target_dte in enumerate(DTE_DAYS):
-                if typed.empty:
-                    continue
-                score = (
-                    (typed["strike_price"] - target_strike).abs() / max(spot, 1.0)
-                    + (dte.loc[typed.index] - target_dte).abs() * 0.01
-                )
+                score = strike_distance + (
+                    typed_dte - target_dte
+                ).abs() * 0.01
                 best_index = score.nsmallest(1).index
                 if len(best_index) == 0:
                     continue
-                candidate_idx = option_type_idx * len(STRIKE_OFFSETS) * len(DTE_DAYS) + strike_idx * len(DTE_DAYS) + dte_idx
-                selected[candidate_idx] = str(typed.loc[best_index[0], "raw_symbol"])
+                candidate_idx = (
+                    option_type_idx * len(STRIKE_OFFSETS) * len(DTE_DAYS)
+                    + strike_idx * len(DTE_DAYS)
+                    + dte_idx
+                )
+                selected[candidate_idx] = str(
+                    typed.loc[best_index[0], "raw_symbol"]
+                )
     return selected
 
 
@@ -104,21 +131,15 @@ def _effective_definition(
     trade_date: pd.Timestamp,
 ) -> pd.Series | None:
     """Return the definition effective on the requested trading date."""
-    meta = definitions[
-        definitions["raw_symbol"].astype(str) == str(raw_symbol)
-    ].copy()
+    meta = definitions[definitions["raw_symbol"].astype(str) == str(raw_symbol)]
     if meta.empty:
         return None
     if "ts_event" in meta.columns:
-        events = pd.to_datetime(meta["ts_event"], utc=True, errors="coerce")
         cutoff = trade_date.tz_convert("UTC")
-        meta = meta.loc[events.notna() & (events <= cutoff)].copy()
+        meta = meta[meta["ts_event"].notna() & (meta["ts_event"] <= cutoff)]
         if meta.empty:
             return None
-        meta["ts_event"] = pd.to_datetime(
-            meta["ts_event"], utc=True, errors="coerce"
-        )
-        meta = meta.sort_values("ts_event")
+        return meta.sort_values("ts_event").iloc[-1]
     return meta.iloc[-1]
 
 
@@ -369,6 +390,9 @@ def build_real_options_panel(
             f"[definitions] Saved {len(definitions):,} definition rows "
             f"to {definition_cache}"
         )
+
+    definitions = _prepare_definitions(definitions)
+    print(f"[definitions] Prepared {len(definitions):,} usable definition rows")
 
     selected_by_day: dict[object, dict[int, str]] = {}
     all_symbols: set[str] = set()
