@@ -17,6 +17,7 @@ ET = ZoneInfo("America/New_York")
 DATASET = "OPRA.PILLAR"
 # Databento bills historical usage in USD; the hard program limit is $20.
 DEFAULT_MAX_COST_USD = 20.0
+DEFAULT_CACHE_DIR = "data/databento_cache"
 
 
 def _option_type(value: object, raw_symbol: object) -> str | None:
