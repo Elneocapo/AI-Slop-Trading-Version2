@@ -114,7 +114,7 @@ def _effective_definition(
 
 def _fetch_quotes(
     client: db.Historical,
-    symbols: list[str],
+    symbols: list[int],
     start: pd.Timestamp,
     end: pd.Timestamp,
 ) -> pd.DataFrame:
@@ -125,7 +125,7 @@ def _fetch_quotes(
     data = client.timeseries.get_range(
         dataset=DATASET,
         schema="cbbo-1m",
-        stype_in="raw_symbol",
+        stype_in="instrument_id",
         symbols=symbols,
         start=start,
         end=end,
@@ -295,7 +295,35 @@ def build_real_options_panel(
             f"cumulative ${estimated_cost_usd:,.4f} / ${max_cost_usd:,.2f}"
         )
 
-        quotes = _fetch_quotes(client, quote_symbols, day_start, day_end)
+        # Resolve OCC raw symbols to instrument IDs for this exact
+        # historical day. Instrument IDs are only guaranteed to be unique
+        # within a given day.
+        resolution = client.symbology.resolve(
+            dataset=DATASET,
+            symbols=quote_symbols,
+            stype_in="raw_symbol",
+            stype_out="instrument_id",
+            start_date=pd.Timestamp(trade_date).date().isoformat(),
+            end_date=pd.Timestamp(trade_date).date().isoformat(),
+        )
+        resolved = resolution.get("result", {}) if isinstance(resolution, dict) else {}
+        symbol_to_instrument: dict[str, int] = {}
+        for raw_symbol, intervals in resolved.items():
+            if not intervals:
+                continue
+            interval = intervals[-1]
+            try:
+                symbol_to_instrument[str(raw_symbol)] = int(interval["s"])
+            except (KeyError, TypeError, ValueError):
+                continue
+
+        instrument_ids = sorted(set(symbol_to_instrument.values()))
+        if not instrument_ids:
+            raise RuntimeError(
+                f"Databento could not resolve any selected NVDA option symbols on {trade_date}."
+            )
+
+        quotes = _fetch_quotes(client, instrument_ids, day_start, day_end)
 
         quote_by_instrument = (
             {
@@ -309,20 +337,10 @@ def build_real_options_panel(
         )
 
         for candidate_idx, symbol in selected.items():
-            definition = _effective_definition(
-                definitions,
-                symbol,
-                pd.Timestamp(trade_date, tz=ET),
-            )
-            if definition is None or "instrument_id" not in definition:
+            if str(symbol) not in symbol_to_instrument:
                 continue
-
-            instrument_id = pd.to_numeric(
-                definition["instrument_id"], errors="coerce"
-            )
-            if not np.isfinite(instrument_id):
-                continue
-            q = quote_by_instrument.get(int(instrument_id))
+            instrument_id = symbol_to_instrument[str(symbol)]
+            q = quote_by_instrument.get(instrument_id)
             if q is None or q.empty:
                 continue
 
