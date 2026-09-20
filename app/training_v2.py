@@ -80,10 +80,15 @@ def align_real_data_to_option_panel(data: pd.DataFrame, option_panel: pd.DataFra
         float(regular_aligned["timestamp"].isin(coverage).mean())
         if len(regular_aligned) else 0.0
     )
-    if aligned_ratio < 0.90:
+    # A small amount of missing hourly coverage is expected after resampling
+    # 1-minute OPRA quotes onto Yahoo's hourly timestamps. The real environment
+    # already handles missing individual candidate quotes by masking unavailable
+    # entries and carrying the last usable position quote. Require 80% coverage
+    # rather than rejecting otherwise usable historical data.
+    if aligned_ratio < 0.80:
         raise ValueError(
             f"Real options quote coverage is only {aligned_ratio:.1%} of the aligned "
-            "regular-session underlying timestamps. Need at least 90%. Rebuild the "
+            "regular-session underlying timestamps. Need at least 80%. Rebuild the "
             "Databento panel for a longer/cleaner period before training."
         )
     print(
