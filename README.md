@@ -108,13 +108,13 @@ Historical options-chain availability varies by provider; the project does not p
 
 ## Databento cost guard
 
-The historical OPRA downloader has a hard default cost ceiling of **$12 USD** (intentionally conservative versus a €12 budget). Before each billable historical batch, it calls Databento's cost metadata endpoint; if the next batch would push the cumulative estimate above the limit, the download stops before requesting that batch. Databento provides `metadata.get_cost` specifically for checking historical request cost before downloading data.
+The historical OPRA downloader has a hard default cost ceiling of **$20 USD**. Before each billable historical batch, it calls Databento's cost metadata endpoint; if the next batch would push the cumulative estimate above the limit, the download stops before requesting that batch. Databento provides `metadata.get_cost` specifically for checking historical request cost before downloading data.
 
 Run it with:
 
 ```powershell
 $env:DATABENTO_API_KEY="YOUR_KEY"
-python -m app.data.databento_options --ticker NVDA --period 30d --max-cost-usd 12
+python -m app.data.databento_options --ticker NVDA --period 30d --max-cost-usd 20
 ```
 
 The downloader also includes the option-definition request in the same budget and only writes the output file after a successful run.
