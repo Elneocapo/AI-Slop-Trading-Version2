@@ -40,7 +40,46 @@ def make_env(data, option_panel=None, fixed_start=None, episode_hours=EPISODE_HO
 def load_option_panel(path: Path) -> pd.DataFrame:
     if not path.exists():
         raise FileNotFoundError(f"Options panel not found: {path}")
-    return pd.read_csv(path)
+    panel = pd.read_csv(path)
+    required = {"timestamp", "candidate_idx", "symbol", "strike", "expiry", "option_type", "bid", "ask"}
+    missing = required - set(panel.columns)
+    if missing:
+        raise ValueError(f"Options panel missing columns: {sorted(missing)}")
+    panel["timestamp"] = pd.to_datetime(panel["timestamp"], errors="coerce")
+    panel = panel.dropna(subset=["timestamp"]).copy()
+    if panel.empty:
+        raise ValueError(f"Options panel is empty: {path}")
+    return panel
+
+
+def align_real_data_to_option_panel(data: pd.DataFrame, option_panel: pd.DataFrame) -> pd.DataFrame:
+    """Restrict underlying data to the exact historical window covered by real option quotes."""
+    panel_ts = pd.DatetimeIndex(option_panel["timestamp"])
+    data_ts = pd.DatetimeIndex(data["timestamp"])
+    panel_start = panel_ts.min()
+    panel_end = panel_ts.max()
+    aligned = data.loc[(data_ts >= panel_start) & (data_ts <= panel_end)].reset_index(drop=True)
+    required = LOOKBACK + (2 * EPISODE_HOURS) + 1
+    if len(aligned) < required:
+        raise ValueError(
+            "Real options panel does not cover enough underlying history for a full "
+            f"training + 145-day OOS run. Need at least {required} hourly candles "
+            f"inside the panel window, but only {len(aligned)} are covered. "
+            "Rebuild the Databento panel with a longer period (recommended: 365d)."
+        )
+    coverage = set(pd.DatetimeIndex(option_panel["timestamp"]))
+    aligned_ratio = float(aligned["timestamp"].isin(coverage).mean()) if len(aligned) else 0.0
+    if aligned_ratio < 0.90:
+        raise ValueError(
+            f"Real options quote coverage is only {aligned_ratio:.1%} of the aligned "
+            "underlying timestamps. Need at least 90%. Rebuild the Databento panel "
+            "for a longer/cleaner period before training."
+        )
+    print(
+        f"[real] Using underlying window {panel_start} -> {panel_end} | "
+        f"{len(aligned):,} hourly candles | quote coverage {aligned_ratio:.1%}"
+    )
+    return aligned
 
 
 class RiskManagedPPOEnv(gym.Wrapper):
@@ -455,6 +494,8 @@ def train(ticker: str, timesteps: int = DEFAULT_TIMESTEPS, period: str = "730d",
     data = load_hourly_data(ticker, period)
     option_panel = load_option_panel(Path(options_file)) if data_source in {"real", "alpaca"} else None
     model_suffix = "_real" if data_source == "real" else "_alpaca" if data_source == "alpaca" else ""
+    if data_source == "real":
+        data = align_real_data_to_option_panel(data, option_panel)
     if len(data) <= EPISODE_HOURS + LOOKBACK + 100:
         raise ValueError("Not enough hourly history for training")
     split = len(data) - EPISODE_HOURS - 1
@@ -593,6 +634,8 @@ def main():
     if a.eval_only:
         data = load_hourly_data(ticker, a.period)
         option_panel = load_option_panel(Path(a.options_file)) if a.data_source in {"real", "alpaca"} else None
+        if a.data_source == "real":
+            data = align_real_data_to_option_panel(data, option_panel)
         split = len(data) - EPISODE_HOURS - 1
         test_data = data.iloc[split - LOOKBACK:].reset_index(drop=True)
         model_suffix = "_real" if a.data_source == "real" else "_alpaca" if a.data_source == "alpaca" else ""
