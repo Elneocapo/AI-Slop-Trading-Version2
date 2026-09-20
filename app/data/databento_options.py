@@ -142,7 +142,7 @@ def _effective_definition(
     return meta.iloc[-1]
 
 
-def _read_batch_data_files(raw_dir: Path) -> pd.DataFrame:
+def _batch_data_files(raw_dir: Path) -> list[Path]:
     files = sorted(
         path
         for path in raw_dir.rglob("*")
@@ -154,20 +154,12 @@ def _read_batch_data_files(raw_dir: Path) -> pd.DataFrame:
         raise RuntimeError(
             f"No Databento batch CSV files found in {raw_dir}."
         )
+    return files
 
-    frames = []
-    for path in files:
-        compression = "zstd" if path.name.endswith(".zst") else None
-        frame = pd.read_csv(path, compression=compression)
-        if not frame.empty:
-            frames.append(frame)
 
-    if not frames:
-        raise RuntimeError(
-            "Databento batch files were downloaded but contained no records."
-        )
-    return pd.concat(frames, ignore_index=True)
-
+def _read_batch_data_file(path: Path) -> pd.DataFrame:
+    compression = "zstd" if path.name.endswith(".zst") else None
+    return pd.read_csv(path, compression=compression)
 
 def _wait_for_batch_job(
     client: db.Historical,
@@ -575,156 +567,138 @@ def build_real_options_panel(
         manifest["actual_batch_cost_usd"] = actual_cost_total
         _save_json_manifest(manifest_path, manifest)
 
-    raw_df = _read_batch_data_files(raw_dir)
-    required = {"symbol", "ts_recv", "bid_px_00", "ask_px_00"}
-    missing = required - set(raw_df.columns)
-    if missing:
-        raise RuntimeError(
-            f"Databento cbbo-1m batch is missing fields: {sorted(missing)}"
-        )
-
-    raw_df["symbol"] = raw_df["symbol"].astype(str)
-    raw_df["timestamp"] = pd.to_datetime(
-        raw_df["ts_recv"], utc=True, errors="coerce"
-    ).dt.tz_convert(ET)
-    raw_df["bid"] = pd.to_numeric(
-        raw_df["bid_px_00"], errors="coerce"
-    )
-    raw_df["ask"] = pd.to_numeric(
-        raw_df["ask_px_00"], errors="coerce"
-    )
-    raw_df = raw_df.dropna(
-        subset=["symbol", "timestamp", "bid", "ask"]
-    )
-    raw_df = raw_df[
-        (raw_df["bid"] >= 0)
-        & (raw_df["ask"] > 0)
-        & (raw_df["ask"] >= raw_df["bid"])
-    ].sort_values(["symbol", "timestamp"])
-
-    # The selected symbols are already limited to the contracts the RL
-    # environment can actually choose. Everything else in the batch is
-    # ignored when constructing the compact panel.
-    selected_symbols = all_symbols
-    raw_df = raw_df[raw_df["symbol"].isin(selected_symbols)]
-    if raw_df.empty:
-        raise RuntimeError(
-            "Databento batch contains no usable quotes for the selected contracts."
-        )
-
+    # Process one OPRA file at a time. Concatenating a full year's
+    # cbbo-1m data can require more RAM than the machine has available.
+    raw_files = _batch_data_files(raw_dir)
     panel_rows: list[dict] = []
 
-    for trade_date, selected in selected_by_day.items():
-        day_date = pd.Timestamp(trade_date).date()
-        day_start = pd.Timestamp(
-            day_date, tz=ET
-        ) + pd.Timedelta(hours=9, minutes=30)
-        day_end = pd.Timestamp(
-            day_date, tz=ET
-        ) + pd.Timedelta(hours=16)
-
-        day_quotes = raw_df[
-            (raw_df["timestamp"] >= day_start)
-            & (raw_df["timestamp"] <= day_end)
-        ]
-        if day_quotes.empty:
-            continue
-
-        base = pd.DataFrame(
-            {
-                "timestamp": pd.DatetimeIndex(
-                    underlying.loc[
-                        local_dates == trade_date, "timestamp"
-                    ]
-                )
-            }
+    for file_number, raw_path in enumerate(raw_files, start=1):
+        print(
+            f"[panel] Processing raw file {file_number}/{len(raw_files)}: "
+            f"{raw_path.name}"
         )
-        base = base[
-            (base["timestamp"] >= day_start)
-            & (base["timestamp"] <= day_end)
-        ].sort_values("timestamp")
-        if base.empty:
+        raw_df = _read_batch_data_file(raw_path)
+        if raw_df.empty:
             continue
 
-        for candidate_idx, symbol in selected.items():
-            q = day_quotes[
-                day_quotes["symbol"] == str(symbol)
-            ][["timestamp", "bid", "ask"]].sort_values("timestamp")
-            if q.empty:
-                continue
-
-            # Pandas merge_asof requires identical datetime64 precision.
-            # Yahoo-derived hourly timestamps can be second-resolution while
-            # Databento quote timestamps are typically nanosecond-resolution.
-            merge_base = base.copy()
-            merge_quotes = q.copy()
-            merge_base["timestamp"] = pd.to_datetime(
-                merge_base["timestamp"], utc=True, errors="coerce"
-            )
-            merge_quotes["timestamp"] = pd.to_datetime(
-                merge_quotes["timestamp"], utc=True, errors="coerce"
-            )
-            merge_base["timestamp"] = merge_base["timestamp"].astype(
-                "datetime64[ns, UTC]"
-            )
-            merge_quotes["timestamp"] = merge_quotes["timestamp"].astype(
-                "datetime64[ns, UTC]"
+        required = {"symbol", "ts_recv", "bid_px_00", "ask_px_00"}
+        missing = required - set(raw_df.columns)
+        if missing:
+            raise RuntimeError(
+                f"Databento cbbo-1m batch is missing fields: {sorted(missing)}"
             )
 
-            merged = pd.merge_asof(
-                merge_base,
-                merge_quotes,
-                on="timestamp",
-                direction="backward",
-            )
-            merged = merged.dropna(subset=["bid", "ask"])
-            if merged.empty:
+        raw_df = raw_df[["symbol", "ts_recv", "bid_px_00", "ask_px_00"]].copy()
+        raw_df["symbol"] = raw_df["symbol"].astype(str)
+        raw_df["timestamp"] = pd.to_datetime(
+            raw_df["ts_recv"], utc=True, errors="coerce"
+        ).dt.tz_convert(ET)
+        raw_df["bid"] = pd.to_numeric(raw_df["bid_px_00"], errors="coerce")
+        raw_df["ask"] = pd.to_numeric(raw_df["ask_px_00"], errors="coerce")
+        raw_df = raw_df.dropna(
+            subset=["symbol", "timestamp", "bid", "ask"]
+        )
+        raw_df = raw_df[
+            (raw_df["bid"] >= 0)
+            & (raw_df["ask"] > 0)
+            & (raw_df["ask"] >= raw_df["bid"])
+            & raw_df["symbol"].isin(all_symbols)
+        ]
+        if raw_df.empty:
+            continue
+
+        raw_df = raw_df.sort_values(["symbol", "timestamp"])
+        for trade_date in sorted(set(raw_df["timestamp"].dt.date.unique())):
+            selected = selected_by_day.get(trade_date)
+            if not selected:
                 continue
 
-            definition = _effective_definition(
-                definitions,
-                symbol,
-                pd.Timestamp(trade_date, tz=ET),
-            )
-            if definition is None:
+            day_date = pd.Timestamp(trade_date).date()
+            day_start = pd.Timestamp(day_date, tz=ET) + pd.Timedelta(hours=9, minutes=30)
+            day_end = pd.Timestamp(day_date, tz=ET) + pd.Timedelta(hours=16)
+            day_quotes = raw_df[
+                (raw_df["timestamp"] >= day_start)
+                & (raw_df["timestamp"] <= day_end)
+            ]
+            if day_quotes.empty:
                 continue
 
-            expiry = _normalize_option_expiration(
-                pd.Series([definition["expiration"]], index=[0])
-            ).iloc[0]
-            if pd.isna(expiry):
-                continue
-            strike = float(definition["strike_price"])
-            option_type = _option_type(
-                definition.get("instrument_class", ""),
-                symbol,
+            base = pd.DataFrame(
+                {"timestamp": pd.DatetimeIndex(underlying.loc[local_dates == trade_date, "timestamp"])}
             )
-            if option_type is None:
+            base = base[
+                (base["timestamp"] >= day_start)
+                & (base["timestamp"] <= day_end)
+            ].sort_values("timestamp")
+            if base.empty:
                 continue
 
-            for row in merged.itertuples(index=False):
-                panel_rows.append(
-                    {
-                        "timestamp": pd.Timestamp(
-                            row.timestamp
-                        ).tz_convert(ET).isoformat(),
-                        "candidate_idx": int(candidate_idx),
-                        "symbol": str(symbol),
-                        "strike": strike,
-                        "expiry": expiry.isoformat(),
-                        "option_type": option_type,
-                        "bid": float(row.bid),
-                        "ask": float(row.ask),
-                    }
+            for candidate_idx, symbol in selected.items():
+                q = day_quotes[
+                    day_quotes["symbol"] == str(symbol)
+                ][["timestamp", "bid", "ask"]].sort_values("timestamp")
+                if q.empty:
+                    continue
+
+                merge_base = base.copy()
+                merge_quotes = q.copy()
+                merge_base["timestamp"] = pd.to_datetime(
+                    merge_base["timestamp"], utc=True, errors="coerce"
+                ).astype("datetime64[ns, UTC]")
+                merge_quotes["timestamp"] = pd.to_datetime(
+                    merge_quotes["timestamp"], utc=True, errors="coerce"
+                ).astype("datetime64[ns, UTC]")
+
+                merged = pd.merge_asof(
+                    merge_base,
+                    merge_quotes,
+                    on="timestamp",
+                    direction="backward",
+                ).dropna(subset=["bid", "ask"])
+                if merged.empty:
+                    continue
+
+                definition = _effective_definition(
+                    definitions,
+                    symbol,
+                    pd.Timestamp(trade_date, tz=ET),
                 )
+                if definition is None or pd.isna(definition["expiration"]):
+                    continue
 
-    panel = pd.DataFrame(panel_rows)
-    if panel.empty:
+                expiry = definition["expiration"]
+                strike = float(definition["strike_price"])
+                option_type = _option_type(
+                    definition.get("instrument_class", ""),
+                    symbol,
+                )
+                if option_type is None:
+                    continue
+
+                for row in merged.itertuples(index=False):
+                    panel_rows.append(
+                        {
+                            "timestamp": pd.Timestamp(row.timestamp).tz_convert(ET).isoformat(),
+                            "candidate_idx": int(candidate_idx),
+                            "symbol": str(symbol),
+                            "strike": strike,
+                            "expiry": expiry.isoformat(),
+                            "option_type": option_type,
+                            "bid": float(row.bid),
+                            "ask": float(row.ask),
+                        }
+                    )
+
+        del raw_df
+        print(f"[panel] Finished raw file {file_number}/{len(raw_files)}")
+
+    if not panel_rows:
         raise RuntimeError(
             "The cached OPRA batch was downloaded, but no selected "
             "historical quotes could be mapped to the hourly timeline."
         )
 
+    panel = pd.DataFrame(panel_rows)
     panel = panel.drop_duplicates(
         ["timestamp", "candidate_idx"], keep="last"
     ).sort_values(["timestamp", "candidate_idx"])
