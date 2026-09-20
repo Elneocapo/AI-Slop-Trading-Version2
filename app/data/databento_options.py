@@ -45,6 +45,20 @@ def _first_regular_spot(day_data: pd.DataFrame) -> float | None:
     return float(regular_data["Close"].iloc[0])
 
 
+def _normalize_option_expiration(values: pd.Series) -> pd.Series:
+    """Convert Databento's UTC-midnight expiration date to 16:00 ET."""
+    parsed = pd.to_datetime(values, utc=True, errors="coerce")
+    return pd.Series(
+        [
+            pd.NaT
+            if pd.isna(ts)
+            else pd.Timestamp(ts.date(), tz=ET) + pd.Timedelta(hours=16)
+            for ts in parsed
+        ],
+        index=values.index,
+    )
+
+
 def _select_daily_contracts(
     definitions: pd.DataFrame,
     trade_date: pd.Timestamp,
@@ -59,7 +73,7 @@ def _select_daily_contracts(
         _option_type(a, b) for a, b in zip(defs["instrument_class"], defs["raw_symbol"])
     ]
     defs = defs[defs["option_type"].isin(["CALL", "PUT"])]
-    defs["expiration"] = pd.to_datetime(defs["expiration"], utc=True, errors="coerce").dt.tz_convert(ET)
+    defs["expiration"] = _normalize_option_expiration(defs["expiration"])
     defs["strike_price"] = pd.to_numeric(defs["strike_price"], errors="coerce")
     defs = defs.dropna(subset=["expiration", "strike_price", "raw_symbol"])
 
@@ -577,14 +591,11 @@ def build_real_options_panel(
             if definition is None:
                 continue
 
-            expiry = pd.to_datetime(
-                definition["expiration"],
-                utc=True,
-                errors="coerce",
-            )
+            expiry = _normalize_option_expiration(
+                pd.Series([definition["expiration"]], index=[0])
+            ).iloc[0]
             if pd.isna(expiry):
                 continue
-            expiry = expiry.tz_convert(ET)
             strike = float(definition["strike_price"])
             option_type = _option_type(
                 definition.get("instrument_class", ""),
