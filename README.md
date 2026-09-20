@@ -112,7 +112,7 @@ The OPRA downloader is cache-first. It estimates the cost before any billable re
 
 Once the processed panel exists, training and evaluation use the local file and do not call Databento for quote data.
 
-Databento batch downloads are designed for repeated local access without an additional charge after the initial download. citeturn663249search0turn985324search1
+Databento batch downloads are intended for repeated access after the initial batch download, and the project additionally keeps a local copy so the RL workflow does not need Databento at all after preprocessing.
 
 Run the first download with the hard $20 ceiling:
 
@@ -126,4 +126,6 @@ After that, use the local panel for RL training:
 ```powershell
 python train_ai.py --ticker NVDA --timesteps 100000 --data-source real --options-file data/nvda_real_options.csv.gz
 ```
+
+For later runs with the same period, if `data/nvda_real_options.csv.gz` exists, the downloader exits immediately and uses the local panel without needing the Databento API key.
 
