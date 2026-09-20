@@ -248,24 +248,10 @@ class RiskManagedPPOEnv(gym.Wrapper):
             return np.array([0, option_type, strike_idx, dte_idx, 0], dtype=np.int64)
 
         execution_price = float(candidate["ask"]) * (1.0 + self.env.slippage)
-        allowed_size_idx = None
-        for idx, contracts in enumerate(CONTRACT_SIZES):
-            required = execution_price * self.env.multiplier * contracts + self.env.transaction_cost
-            if required <= risk_budget and required <= float(self.env.cash):
-                allowed_size_idx = idx
-
-        if allowed_size_idx is None:
-            fallback = self._cheapest_affordable(option_type, risk_budget)
-            if fallback is None:
-                self.last_rejected = True
-                self.last_invalid_reason = "no_affordable_contract"
-                return np.array([0, option_type, strike_idx, dte_idx, 0], dtype=np.int64)
-            _, strike_idx, dte_idx = fallback
-            candidate = self.env._get_candidate_contract(
-                self.env.t, option_type, strike_idx, dte_idx
-            )
-            allowed_size_idx = 0
-
+        # Start with one contract while the agent learns direction/strike/DTE.
+        # Scaling to 2/3/5/10 contracts before the policy has demonstrated a
+        # stable edge makes a €500 account concentrate too much risk in one trade.
+        allowed_size_idx = 0
         final_contracts = CONTRACT_SIZES[allowed_size_idx]
         final_required = (
             float(candidate["ask"]) * (1.0 + self.env.slippage)
@@ -290,6 +276,13 @@ class RiskManagedPPOEnv(gym.Wrapper):
         pre_equity = max(pre_equity, 1e-9)
         reward = float(np.log(post_equity / pre_equity))
         reward -= float(info.get("drawdown", 0.0)) * DRAWDOWN_REWARD_PENALTY
+
+        # Explicitly discourage letting short-lived long options drift to
+        # expiration. Expiry itself is valid, but with sparse historical quotes
+        # it can turn into a full premium loss before the policy learns to exit.
+        new_trades = self.env.trade_log[-1:] if self.env.trade_log else []
+        if new_trades and new_trades[0].get("reason") == "expiry":
+            reward -= 0.02
 
         if self.last_rejected:
             reward -= INVALID_ACTION_PENALTY
@@ -631,7 +624,7 @@ def train(ticker: str, timesteps: int = DEFAULT_TIMESTEPS, period: str = "730d",
         batch_size=256,
         gamma=0.995,
         gae_lambda=0.95,
-        ent_coef=0.05,
+        ent_coef=0.01,
         clip_range=0.2,
         verbose=1,
         seed=42,
