@@ -68,13 +68,23 @@ def align_real_data_to_option_panel(data: pd.DataFrame, option_panel: pd.DataFra
             f"inside the panel window, but only {len(aligned)} are covered. "
             "Rebuild the Databento panel with a longer period (recommended: 365d)."
         )
+    # OPRA cbbo-1m quotes cover the regular US equity session (09:30-16:00 ET),
+    # while Yahoo 1h data also contains pre/post-market candles. Do not count
+    # extended-hours candles against quote coverage because those candles cannot
+    # have corresponding OPRA quotes by design.
+    aligned_minutes = aligned["timestamp"].dt.hour * 60 + aligned["timestamp"].dt.minute
+    regular_mask = (aligned_minutes >= 570) & (aligned_minutes <= 960)
+    regular_aligned = aligned.loc[regular_mask]
     coverage = set(pd.DatetimeIndex(option_panel["timestamp"]))
-    aligned_ratio = float(aligned["timestamp"].isin(coverage).mean()) if len(aligned) else 0.0
+    aligned_ratio = (
+        float(regular_aligned["timestamp"].isin(coverage).mean())
+        if len(regular_aligned) else 0.0
+    )
     if aligned_ratio < 0.90:
         raise ValueError(
             f"Real options quote coverage is only {aligned_ratio:.1%} of the aligned "
-            "underlying timestamps. Need at least 90%. Rebuild the Databento panel "
-            "for a longer/cleaner period before training."
+            "regular-session underlying timestamps. Need at least 90%. Rebuild the "
+            "Databento panel for a longer/cleaner period before training."
         )
     print(
         f"[real] Using underlying window {panel_start} -> {panel_end} | "
