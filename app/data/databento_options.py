@@ -88,9 +88,8 @@ def _select_daily_contracts(
     if defs.empty:
         return {}
 
-    dte = (defs["expiration"].dt.tz_convert(ET).dt.date - day).map(
-        lambda value: value.days
-    )
+    trade_day = pd.Timestamp(day, tz=ET)
+    dte = (defs["expiration"].dt.normalize() - trade_day).dt.days
     defs = defs[(dte >= 1) & (dte <= max(DTE_DAYS) + 7)]
     if defs.empty:
         return {}
