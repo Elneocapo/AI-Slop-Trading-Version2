@@ -541,9 +541,27 @@ def build_real_options_panel(
             if q.empty:
                 continue
 
+            # Pandas merge_asof requires identical datetime64 precision.
+            # Yahoo-derived hourly timestamps can be second-resolution while
+            # Databento quote timestamps are typically nanosecond-resolution.
+            merge_base = base.copy()
+            merge_quotes = q.copy()
+            merge_base["timestamp"] = pd.to_datetime(
+                merge_base["timestamp"], utc=True, errors="coerce"
+            )
+            merge_quotes["timestamp"] = pd.to_datetime(
+                merge_quotes["timestamp"], utc=True, errors="coerce"
+            )
+            merge_base["timestamp"] = merge_base["timestamp"].astype(
+                "datetime64[ns, UTC]"
+            )
+            merge_quotes["timestamp"] = merge_quotes["timestamp"].astype(
+                "datetime64[ns, UTC]"
+            )
+
             merged = pd.merge_asof(
-                base,
-                q,
+                merge_base,
+                merge_quotes,
                 on="timestamp",
                 direction="backward",
             )
@@ -580,7 +598,7 @@ def build_real_options_panel(
                     {
                         "timestamp": pd.Timestamp(
                             row.timestamp
-                        ).isoformat(),
+                        ).tz_convert(ET).isoformat(),
                         "candidate_idx": int(candidate_idx),
                         "symbol": str(symbol),
                         "strike": strike,
