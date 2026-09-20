@@ -48,15 +48,10 @@ def _first_regular_spot(day_data: pd.DataFrame) -> float | None:
 def _normalize_option_expiration(values: pd.Series) -> pd.Series:
     """Convert Databento's UTC-midnight expiration date to 16:00 ET."""
     parsed = pd.to_datetime(values, utc=True, errors="coerce")
-    return pd.Series(
-        [
-            pd.NaT
-            if pd.isna(ts)
-            else pd.Timestamp(ts.date(), tz=ET) + pd.Timedelta(hours=16)
-            for ts in parsed
-        ],
-        index=values.index,
-    )
+    # Keep this vectorized: a full-year NVDA definition file can contain
+    # hundreds of thousands of rows, making a Python loop unnecessarily slow.
+    dates = parsed.dt.normalize()
+    return (dates + pd.Timedelta(hours=16)).dt.tz_convert(ET)
 
 
 def _select_daily_contracts(
