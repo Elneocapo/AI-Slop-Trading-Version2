@@ -319,19 +319,61 @@ def build_real_options_panel(
             f"[cost] definitions: {definition_cost_usd:.4f} USD | "
             f"remaining budget {max_cost_usd - definition_cost_usd:.4f} USD"
         )
-        definitions = client.timeseries.get_range(
-            dataset=DATASET,
-            schema="definition",
-            stype_in="parent",
-            symbols=f"{ticker}.OPT",
-            start=definition_start,
-            end=definition_end,
-        ).to_df().reset_index()
-        if definitions.empty:
+        # A full-year OPRA definition stream can be very large and may appear
+        # stalled for a long time. Download it in bounded chunks so progress
+        # is visible and each request is smaller.
+        chunks: list[pd.DataFrame] = []
+        chunk_start = definition_start
+        total_span_days = max(
+            1,
+            int((definition_end - definition_start).total_seconds() // 86400),
+        )
+        chunk_number = 0
+        while chunk_start < definition_end:
+            chunk_end = min(
+                chunk_start + pd.Timedelta(days=30),
+                definition_end,
+            )
+            chunk_number += 1
+            elapsed_days = max(
+                0,
+                int((chunk_start - definition_start).total_seconds() // 86400),
+            )
+            print(
+                f"[definitions] chunk {chunk_number} "
+                f"~{elapsed_days}/{total_span_days} days "
+                f"({chunk_start.date()} -> {chunk_end.date()})"
+            )
+            frame = (
+                client.timeseries.get_range(
+                    dataset=DATASET,
+                    schema="definition",
+                    stype_in="parent",
+                    symbols=f"{ticker}.OPT",
+                    start=chunk_start,
+                    end=chunk_end,
+                )
+                .to_df()
+                .reset_index()
+            )
+            if not frame.empty:
+                chunks.append(frame)
+                print(
+                    f"[definitions] chunk {chunk_number} received "
+                    f"{len(frame):,} rows"
+                )
+            chunk_start = chunk_end
+
+        if not chunks:
             raise RuntimeError(
                 f"No OPRA option definitions returned for {ticker}."
             )
+        definitions = pd.concat(chunks, ignore_index=True).drop_duplicates()
         definitions.to_csv(definition_cache, index=False)
+        print(
+            f"[definitions] Saved {len(definitions):,} definition rows "
+            f"to {definition_cache}"
+        )
 
     selected_by_day: dict[object, dict[int, str]] = {}
     all_symbols: set[str] = set()
