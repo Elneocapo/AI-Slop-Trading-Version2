@@ -45,8 +45,9 @@ def load_option_panel(path: Path) -> pd.DataFrame:
     missing = required - set(panel.columns)
     if missing:
         raise ValueError(f"Options panel missing columns: {sorted(missing)}")
-    panel["timestamp"] = pd.to_datetime(panel["timestamp"], errors="coerce")
-    panel = panel.dropna(subset=["timestamp"]).copy()
+    panel["timestamp"] = pd.to_datetime(panel["timestamp"], errors="coerce", utc=True).dt.tz_convert("America/New_York")
+    panel["expiry"] = pd.to_datetime(panel["expiry"], errors="coerce", utc=True).dt.tz_convert("America/New_York")
+    panel = panel.dropna(subset=["timestamp", "expiry"]).copy()
     if panel.empty:
         raise ValueError(f"Options panel is empty: {path}")
     return panel
