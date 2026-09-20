@@ -396,6 +396,514 @@ def build_real_options_panel(
     return output_path
 
 
+
+def _read_batch_data_files(raw_dir: Path) -> pd.DataFrame:
+    files = sorted(
+        path
+        for path in raw_dir.rglob("*")
+        if path.is_file()
+        and (path.name.endswith(".csv") or path.name.endswith(".csv.zst"))
+        and path.name not in {"metadata.csv", "symbology.csv"}
+    )
+    if not files:
+        raise RuntimeError(
+            f"No Databento batch CSV files found in {raw_dir}."
+        )
+
+    frames = []
+    for path in files:
+        compression = "zstd" if path.name.endswith(".zst") else None
+        frame = pd.read_csv(path, compression=compression)
+        if not frame.empty:
+            frames.append(frame)
+
+    if not frames:
+        raise RuntimeError(
+            "Databento batch files were downloaded but contained no records."
+        )
+    return pd.concat(frames, ignore_index=True)
+
+
+def _wait_for_batch_job(
+    client: db.Historical,
+    job_id: str,
+    poll_seconds: float = 3.0,
+    max_polls: int = 600,
+) -> dict:
+    for _ in range(max_polls):
+        details = client.batch.get_job_details(job_id)
+        state = str(details.get("state", "")).lower()
+        progress = details.get("progress")
+        if progress is None:
+            print(f"[batch] state={state}")
+        else:
+            print(f"[batch] state={state} progress={progress}%")
+
+        if state == "done":
+            return details
+        if state in {"expired", "failed", "cancelled"}:
+            raise RuntimeError(
+                f"Databento batch {job_id} ended in state={state}: {details}"
+            )
+        time.sleep(poll_seconds)
+
+    raise TimeoutError(
+        f"Databento batch {job_id} did not finish within the polling window."
+    )
+
+
+def _load_json_manifest(path: Path) -> dict | None:
+    if not path.exists():
+        return None
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        print(f"[cache] Ignoring unreadable manifest {path}: {exc}")
+        return None
+
+
+def _save_json_manifest(path: Path, payload: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(payload, indent=2, default=str),
+        encoding="utf-8",
+    )
+
+
+def build_real_options_panel(
+    ticker: str,
+    period: str,
+    output_path: Path,
+    api_key: str | None = None,
+    max_cost_usd: float = DEFAULT_MAX_COST_USD,
+    cache_dir: Path | None = None,
+) -> Path:
+    api_key = api_key or os.getenv("DATABENTO_API_KEY")
+    if not api_key:
+        raise RuntimeError(
+            "DATABENTO_API_KEY is missing. In PowerShell use "
+            "$env:DATABENTO_API_KEY='YOUR_KEY'."
+        )
+    if max_cost_usd <= 0:
+        raise ValueError("max_cost_usd must be greater than 0.")
+
+    # The processed panel is the first cache layer: training can run entirely
+    # offline once this file exists.
+    if output_path.exists() and output_path.stat().st_size > 0:
+        print(f"[cache] Using existing local panel: {output_path}")
+        return output_path
+
+    cache_dir = cache_dir or Path(DEFAULT_CACHE_DIR)
+    cache_dir.mkdir(parents=True, exist_ok=True)
+
+    underlying = load_hourly_data(ticker, period)
+    timestamps = pd.DatetimeIndex(underlying["timestamp"])
+    local_dates = pd.Series(timestamps.date, index=underlying.index)
+    trade_dates = sorted(local_dates.unique())
+    if not trade_dates:
+        raise RuntimeError(f"No trading dates found for {ticker}.")
+
+    client = db.Historical(api_key)
+    dataset_range = client.metadata.get_dataset_range(dataset=DATASET)
+
+    def_range_data = (
+        dataset_range.get("schema", {}).get("definition", dataset_range)
+        if isinstance(dataset_range, dict)
+        else dataset_range
+    )
+    quote_range_data = (
+        dataset_range.get("schema", {}).get("cbbo-1m", dataset_range)
+        if isinstance(dataset_range, dict)
+        else dataset_range
+    )
+    definition_available_start = pd.Timestamp(
+        def_range_data["start"], tz="UTC"
+    )
+    definition_available_end = pd.Timestamp(
+        def_range_data["end"], tz="UTC"
+    )
+    quote_available_start = pd.Timestamp(
+        quote_range_data["start"], tz="UTC"
+    )
+    quote_available_end = pd.Timestamp(
+        quote_range_data["end"], tz="UTC"
+    )
+
+    requested_definition_start = (
+        pd.Timestamp(trade_dates[0], tz=ET)
+        - pd.Timedelta(days=max(DTE_DAYS) + 15)
+    ).tz_convert("UTC").floor("D")
+    requested_definition_end = (
+        pd.Timestamp(trade_dates[-1], tz=ET)
+        + pd.Timedelta(days=max(DTE_DAYS) + 7)
+    ).tz_convert("UTC")
+    definition_start = max(
+        requested_definition_start,
+        definition_available_start,
+    )
+    definition_end = min(
+        requested_definition_end,
+        definition_available_end,
+    )
+    if definition_start >= definition_end:
+        raise RuntimeError(
+            "The requested period does not overlap the available "
+            "Databento definition range."
+        )
+
+    definition_cache = cache_dir / f"{ticker.lower()}_definitions.csv"
+    if definition_cache.exists() and definition_cache.stat().st_size > 0:
+        definitions = pd.read_csv(definition_cache)
+        definition_cost_usd = 0.0
+        print(f"[cache] Using local definitions: {definition_cache}")
+    else:
+        definition_cost_usd = float(
+            client.metadata.get_cost(
+                dataset=DATASET,
+                symbols=[f"{ticker}.OPT"],
+                schema="definition",
+                start=definition_start,
+                end=definition_end,
+                stype_in="parent",
+            )
+        )
+        if not np.isfinite(definition_cost_usd) or definition_cost_usd < 0:
+            raise RuntimeError(
+                f"Invalid Databento definition cost estimate: {definition_cost_usd}"
+            )
+        if definition_cost_usd > max_cost_usd:
+            raise RuntimeError(
+                "Cost guard stopped before downloading definitions: "
+                f"estimated {definition_cost_usd:.4f} USD exceeds "
+                f"the {max_cost_usd:.2f} USD limit."
+            )
+
+        print(
+            f"[cost] definitions: {definition_cost_usd:.4f} USD | "
+            f"remaining budget {max_cost_usd - definition_cost_usd:.4f} USD"
+        )
+        definitions = client.timeseries.get_range(
+            dataset=DATASET,
+            schema="definition",
+            stype_in="parent",
+            symbols=f"{ticker}.OPT",
+            start=definition_start,
+            end=definition_end,
+        ).to_df().reset_index()
+        if definitions.empty:
+            raise RuntimeError(
+                f"No OPRA option definitions returned for {ticker}."
+            )
+        definitions.to_csv(definition_cache, index=False)
+
+    selected_by_day: dict[object, dict[int, str]] = {}
+    all_symbols: set[str] = set()
+
+    for trade_date in trade_dates:
+        day_data = underlying.loc[local_dates == trade_date]
+        spot = _first_regular_spot(day_data)
+        if spot is None or not np.isfinite(spot):
+            continue
+
+        selected = _select_daily_contracts(
+            definitions,
+            pd.Timestamp(trade_date, tz=ET),
+            spot,
+        )
+        if selected:
+            selected_by_day[trade_date] = selected
+            all_symbols.update(selected.values())
+
+    if not all_symbols:
+        raise RuntimeError(
+            f"No selectable OPRA option contracts were found for {ticker}."
+        )
+
+    quote_start = max(
+        pd.Timestamp(trade_dates[0], tz=ET).tz_convert("UTC"),
+        quote_available_start,
+    )
+    quote_end = min(
+        (
+            pd.Timestamp(trade_dates[-1], tz=ET)
+            + pd.Timedelta(days=1)
+        ).tz_convert("UTC"),
+        quote_available_end,
+    )
+    if quote_start >= quote_end:
+        raise RuntimeError(
+            "The requested period does not overlap the available OPRA quote range."
+        )
+
+    manifest_path = (
+        cache_dir / f"{ticker.lower()}_{period}_opra_batch_cache.json"
+    )
+    raw_dir = (
+        cache_dir / f"{ticker.lower()}_{period}_opra_batch_cache"
+    )
+    manifest = _load_json_manifest(manifest_path)
+
+    if manifest and manifest.get("job_id"):
+        job_id = str(manifest["job_id"])
+        print(f"[cache] Reusing Databento batch job: {job_id}")
+        details = client.batch.get_job_details(job_id)
+        state = str(details.get("state", "")).lower()
+        if state != "done":
+            details = _wait_for_batch_job(client, job_id)
+
+        local_data_files = [
+            path for path in raw_dir.rglob("*")
+            if path.is_file()
+            and (path.name.endswith(".csv") or path.name.endswith(".csv.zst"))
+        ]
+        if not local_data_files:
+            client.batch.download(
+                job_id=job_id,
+                output_dir=raw_dir,
+                keep_zip=False,
+            )
+            print(f"[cache] Downloaded cached batch into {raw_dir}")
+    else:
+        symbols = sorted(all_symbols)
+        estimated_quote_cost = float(
+            client.metadata.get_cost(
+                dataset=DATASET,
+                symbols=symbols,
+                schema="cbbo-1m",
+                start=quote_start,
+                end=quote_end,
+                stype_in="raw_symbol",
+                stype_out="instrument_id",
+            )
+        )
+        if not np.isfinite(estimated_quote_cost) or estimated_quote_cost < 0:
+            raise RuntimeError(
+                f"Invalid Databento quote cost estimate: {estimated_quote_cost}"
+            )
+
+        estimated_total = definition_cost_usd + estimated_quote_cost
+        print(
+            f"[cost] one OPRA batch: {len(symbols):,} contracts | "
+            f"quotes {estimated_quote_cost:.4f} USD | "
+            f"estimated total {estimated_total:.4f} / {max_cost_usd:.2f} USD"
+        )
+        if estimated_total > max_cost_usd:
+            raise RuntimeError(
+                "Databento cost guard stopped before the batch was submitted. "
+                f"Definitions {definition_cost_usd:.4f} USD + "
+                f"quotes {estimated_quote_cost:.4f} USD = "
+                f"{estimated_total:.4f} USD, above the {max_cost_usd:.2f} USD limit."
+            )
+
+        job = client.batch.submit_job(
+            dataset=DATASET,
+            symbols=symbols,
+            schema="cbbo-1m",
+            start=quote_start,
+            end=quote_end,
+            encoding="csv",
+            compression="zstd",
+            pretty_px=True,
+            pretty_ts=True,
+            map_symbols=True,
+            split_duration="day",
+            stype_in="raw_symbol",
+            stype_out="instrument_id",
+        )
+        job_id = str(job["id"])
+        manifest = {
+            "job_id": job_id,
+            "ticker": ticker,
+            "period": period,
+            "symbols": symbols,
+            "quote_start": quote_start.isoformat(),
+            "quote_end": quote_end.isoformat(),
+            "estimated_definition_cost_usd": definition_cost_usd,
+            "estimated_quote_cost_usd": estimated_quote_cost,
+            "estimated_total_cost_usd": estimated_total,
+            "max_cost_usd": max_cost_usd,
+            "dataset": DATASET,
+            "schema": "cbbo-1m",
+            "encoding": "csv",
+            "compression": "zstd",
+            "cache_dir": str(raw_dir),
+        }
+        _save_json_manifest(manifest_path, manifest)
+        print(f"[batch] Submitted: {job_id}")
+
+        details = _wait_for_batch_job(client, job_id)
+        actual_cost = details.get("cost_usd")
+        if actual_cost is not None:
+            actual_cost = float(actual_cost)
+            print(f"[batch] Actual batch cost: {actual_cost:.4f} USD")
+        manifest["actual_batch_cost_usd"] = actual_cost
+        _save_json_manifest(manifest_path, manifest)
+
+        raw_dir.mkdir(parents=True, exist_ok=True)
+        client.batch.download(
+            job_id=job_id,
+            output_dir=raw_dir,
+            keep_zip=False,
+        )
+        print(f"[cache] Raw batch saved locally in {raw_dir}")
+
+    raw_df = _read_batch_data_files(raw_dir)
+    required = {"symbol", "ts_recv", "bid_px_00", "ask_px_00"}
+    missing = required - set(raw_df.columns)
+    if missing:
+        raise RuntimeError(
+            f"Databento cbbo-1m batch is missing fields: {sorted(missing)}"
+        )
+
+    raw_df["symbol"] = raw_df["symbol"].astype(str)
+    raw_df["timestamp"] = pd.to_datetime(
+        raw_df["ts_recv"], utc=True, errors="coerce"
+    ).dt.tz_convert(ET)
+    raw_df["bid"] = pd.to_numeric(
+        raw_df["bid_px_00"], errors="coerce"
+    )
+    raw_df["ask"] = pd.to_numeric(
+        raw_df["ask_px_00"], errors="coerce"
+    )
+    raw_df = raw_df.dropna(
+        subset=["symbol", "timestamp", "bid", "ask"]
+    )
+    raw_df = raw_df[
+        (raw_df["bid"] >= 0)
+        & (raw_df["ask"] > 0)
+        & (raw_df["ask"] >= raw_df["bid"])
+    ].sort_values(["symbol", "timestamp"])
+
+    # The selected symbols are already limited to the contracts the RL
+    # environment can actually choose. Everything else in the batch is
+    # ignored when constructing the compact panel.
+    selected_symbols = all_symbols
+    raw_df = raw_df[raw_df["symbol"].isin(selected_symbols)]
+    if raw_df.empty:
+        raise RuntimeError(
+            "Databento batch contains no usable quotes for the selected contracts."
+        )
+
+    panel_rows: list[dict] = []
+
+    for trade_date, selected in selected_by_day.items():
+        day_date = pd.Timestamp(trade_date).date()
+        day_start = pd.Timestamp(
+            day_date, tz=ET
+        ) + pd.Timedelta(hours=9, minutes=30)
+        day_end = pd.Timestamp(
+            day_date, tz=ET
+        ) + pd.Timedelta(hours=16)
+
+        day_quotes = raw_df[
+            (raw_df["timestamp"] >= day_start)
+            & (raw_df["timestamp"] <= day_end)
+        ]
+        if day_quotes.empty:
+            continue
+
+        base = pd.DataFrame(
+            {
+                "timestamp": pd.DatetimeIndex(
+                    underlying.loc[
+                        local_dates == trade_date, "timestamp"
+                    ]
+                )
+            }
+        )
+        base = base[
+            (base["timestamp"] >= day_start)
+            & (base["timestamp"] <= day_end)
+        ].sort_values("timestamp")
+        if base.empty:
+            continue
+
+        for candidate_idx, symbol in selected.items():
+            q = day_quotes[
+                day_quotes["symbol"] == str(symbol)
+            ][["timestamp", "bid", "ask"]].sort_values("timestamp")
+            if q.empty:
+                continue
+
+            merged = pd.merge_asof(
+                base,
+                q,
+                on="timestamp",
+                direction="backward",
+            )
+            merged = merged.dropna(subset=["bid", "ask"])
+            if merged.empty:
+                continue
+
+            definition = _effective_definition(
+                definitions,
+                symbol,
+                pd.Timestamp(trade_date, tz=ET),
+            )
+            if definition is None:
+                continue
+
+            expiry = pd.to_datetime(
+                definition["expiration"],
+                utc=True,
+                errors="coerce",
+            )
+            if pd.isna(expiry):
+                continue
+            expiry = expiry.tz_convert(ET)
+            strike = float(definition["strike_price"])
+            option_type = _option_type(
+                definition.get("instrument_class", ""),
+                symbol,
+            )
+            if option_type is None:
+                continue
+
+            for row in merged.itertuples(index=False):
+                panel_rows.append(
+                    {
+                        "timestamp": pd.Timestamp(
+                            row.timestamp
+                        ).isoformat(),
+                        "candidate_idx": int(candidate_idx),
+                        "symbol": str(symbol),
+                        "strike": strike,
+                        "expiry": expiry.isoformat(),
+                        "option_type": option_type,
+                        "bid": float(row.bid),
+                        "ask": float(row.ask),
+                    }
+                )
+
+    panel = pd.DataFrame(panel_rows)
+    if panel.empty:
+        raise RuntimeError(
+            "The cached OPRA batch was downloaded, but no selected "
+            "historical quotes could be mapped to the hourly timeline."
+        )
+
+    panel = panel.drop_duplicates(
+        ["timestamp", "candidate_idx"], keep="last"
+    ).sort_values(["timestamp", "candidate_idx"])
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    compression = "gzip" if str(output_path).endswith(".gz") else None
+    panel.to_csv(
+        output_path,
+        index=False,
+        compression=compression,
+    )
+
+    print(
+        f"[cache] Saved processed panel: {output_path} | "
+        f"{len(panel):,} rows | {panel['symbol'].nunique():,} contracts"
+    )
+    print(
+        "[cache] Future runs with this panel use local files and do not "
+        "request quote data from Databento."
+    )
+    return output_path
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Download real historical NVDA options NBBO data from Databento OPRA.")
     parser.add_argument("--ticker", default="NVDA")
