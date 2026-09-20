@@ -144,11 +144,18 @@ class RealOptionsTradingEnv(OptionsTradingEnv):
             return self.cash + bid * self.multiplier * self.position.contracts
         return self.cash + self.position.collateral - ask * self.multiplier * self.position.contracts
 
-    def _close(self):
+    def _close(self, mark_t: int | None = None, reason: str = "close"):
         if self.position is None:
             return
         position = self.position
-        decision_t = max(self.t - 1, 0)
+        # Use the requested mark time for forced risk-stop liquidation. For
+        # normal policy closes, t-1 remains the last observed bar and avoids
+        # introducing look-ahead into the execution price.
+        if reason == "risk_stop":
+            decision_t = self.t if mark_t is None else int(mark_t)
+        else:
+            decision_t = max(self.t - 1, 0) if mark_t is None else int(mark_t)
+        decision_t = min(max(decision_t, 0), len(self.data) - 1)
         bid, ask = self._position_bid_ask(decision_t)
         if bid <= 0 and ask <= 0:
             return
@@ -167,14 +174,14 @@ class RealOptionsTradingEnv(OptionsTradingEnv):
 
         self.trade_log.append({
             "entry_t": position.entry_t,
-            "exit_t": self.t,
+            "exit_t": decision_t,
             "kind": position.kind,
             "strike": position.strike,
             "contracts": position.contracts,
             "entry_price": position.entry_price,
             "exit_price": execution_price,
             "pnl": pnl,
-            "reason": "close",
+            "reason": reason,
             "transaction_costs": 2.0 * self.transaction_cost,
             "symbol": position.symbol,
         })
