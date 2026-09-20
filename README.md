@@ -106,15 +106,24 @@ The application provides:
 
 Historical options-chain availability varies by provider; the project does not pretend that current option chains are equivalent to a complete historical options database.
 
-## Databento cost guard
+## Databento historical options cache
 
-The historical OPRA downloader has a hard default cost ceiling of **$20 USD**. Before each billable historical batch, it calls Databento's cost metadata endpoint; if the next batch would push the cumulative estimate above the limit, the download stops before requesting that batch. Databento provides `metadata.get_cost` specifically for checking historical request cost before downloading data.
+The OPRA downloader is cache-first. It estimates the cost before any billable request, submits one batch for the selected NVDA contracts, stores the raw batch under `data/databento_cache/`, and builds the processed panel at `data/nvda_real_options.csv.gz`.
 
-Run it with:
+Once the processed panel exists, training and evaluation use the local file and do not call Databento for quote data.
+
+Databento batch downloads are designed for repeated local access without an additional charge after the initial download. citeturn663249search0turn985324search1
+
+Run the first download with the hard $20 ceiling:
 
 ```powershell
 $env:DATABENTO_API_KEY="YOUR_KEY"
 python -m app.data.databento_options --ticker NVDA --period 30d --max-cost-usd 20
 ```
 
-The downloader also includes the option-definition request in the same budget and only writes the output file after a successful run.
+After that, use the local panel for RL training:
+
+```powershell
+python train_ai.py --ticker NVDA --timesteps 100000 --data-source real --options-file data/nvda_real_options.csv.gz
+```
+
