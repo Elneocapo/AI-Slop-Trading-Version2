@@ -87,6 +87,31 @@ def _select_daily_contracts(
     return selected
 
 
+
+def _effective_definition(
+    definitions: pd.DataFrame,
+    raw_symbol: str,
+    trade_date: pd.Timestamp,
+) -> pd.Series | None:
+    """Return the definition effective on the requested trading date."""
+    meta = definitions[
+        definitions["raw_symbol"].astype(str) == str(raw_symbol)
+    ].copy()
+    if meta.empty:
+        return None
+    if "ts_event" in meta.columns:
+        events = pd.to_datetime(meta["ts_event"], utc=True, errors="coerce")
+        cutoff = trade_date.tz_convert("UTC")
+        meta = meta.loc[events.notna() & (events <= cutoff)].copy()
+        if meta.empty:
+            return None
+        meta["ts_event"] = pd.to_datetime(
+            meta["ts_event"], utc=True, errors="coerce"
+        )
+        meta = meta.sort_values("ts_event")
+    return meta.iloc[-1]
+
+
 def _fetch_quotes(
     client: db.Historical,
     symbols: list[str],
@@ -280,19 +305,13 @@ def build_real_options_panel(
         )
 
         for candidate_idx, symbol in selected.items():
-            meta = definitions[
-                definitions["raw_symbol"].astype(str) == symbol
-            ].copy()
-            if meta.empty or "instrument_id" not in meta.columns:
+            definition = _effective_definition(
+                definitions,
+                symbol,
+                pd.Timestamp(trade_date, tz=ET),
+            )
+            if definition is None or "instrument_id" not in definition:
                 continue
-            if "ts_event" in meta.columns:
-                meta["ts_event"] = pd.to_datetime(
-                    meta["ts_event"], utc=True, errors="coerce"
-                )
-                effective = meta.dropna(subset=["ts_event"]).sort_values("ts_event")
-                definition = effective.iloc[-1] if not effective.empty else meta.iloc[-1]
-            else:
-                definition = meta.iloc[-1]
 
             instrument_id = pd.to_numeric(
                 definition["instrument_id"], errors="coerce"
