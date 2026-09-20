@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
+import time
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -158,11 +160,17 @@ def build_real_options_panel(
     api_key: str | None = None,
     max_cost_usd: float = DEFAULT_MAX_COST_USD,
 ) -> Path:
+    # A processed local panel is fully offline: no API key or network call is
+    # needed once the cache exists.
+    if output_path.exists() and output_path.stat().st_size > 0:
+        print(f"[cache] Using existing local panel: {output_path}")
+        return output_path
+
     api_key = api_key or os.getenv("DATABENTO_API_KEY")
     if not api_key:
         raise RuntimeError(
-            "DATABENTO_API_KEY is missing. Create a Databento account/API key and set "
-            "$env:DATABENTO_API_KEY='YOUR_KEY' in PowerShell."
+            "DATABENTO_API_KEY is missing. In PowerShell use "
+            "$env:DATABENTO_API_KEY='YOUR_KEY'."
         )
 
     underlying = load_hourly_data(ticker, period)
@@ -487,12 +495,6 @@ def build_real_options_panel(
     if max_cost_usd <= 0:
         raise ValueError("max_cost_usd must be greater than 0.")
 
-    # The processed panel is the first cache layer: training can run entirely
-    # offline once this file exists.
-    if output_path.exists() and output_path.stat().st_size > 0:
-        print(f"[cache] Using existing local panel: {output_path}")
-        return output_path
-
     cache_dir = cache_dir or Path(DEFAULT_CACHE_DIR)
     cache_dir.mkdir(parents=True, exist_ok=True)
 
@@ -551,7 +553,9 @@ def build_real_options_panel(
             "Databento definition range."
         )
 
-    definition_cache = cache_dir / f"{ticker.lower()}_definitions.csv"
+    definition_cache = cache_dir / (
+        f"{ticker.lower()}_{period}_definitions.csv"
+    )
     if definition_cache.exists() and definition_cache.stat().st_size > 0:
         definitions = pd.read_csv(definition_cache)
         definition_cost_usd = 0.0
