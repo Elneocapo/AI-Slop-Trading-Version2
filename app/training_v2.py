@@ -23,7 +23,9 @@ MAX_TRADE_RISK_PCT = 0.10
 INVALID_ACTION_PENALTY = 0.01
 NO_POSITION_CLOSE_PENALTY = 0.002
 DRAWDOWN_REWARD_PENALTY = 0.01
-HOLDING_DECAY_PENALTY = 0.0005
+HOLDING_DECAY_PENALTY = 0.0015
+EXPIRY_REWARD_PENALTY = 0.03
+MIN_ENTRY_DTE_INDEX = 1  # Skip 1-DTE entries during policy learning.
 
 
 def make_env(data, option_panel=None, fixed_start=None, episode_hours=EPISODE_HOURS):
@@ -137,6 +139,8 @@ class RiskManagedPPOEnv(gym.Wrapper):
         operation, option_type, strike_idx, dte_idx = self._decode(action)
         if operation != 1 or self.env.position is not None:
             return False
+        if dte_idx < MIN_ENTRY_DTE_INDEX:
+            return False
         budget = self._risk_budget()
         if budget <= self.env.transaction_cost:
             return False
@@ -191,6 +195,8 @@ class RiskManagedPPOEnv(gym.Wrapper):
                     self.env.t, option_type, strike_idx, dte_idx
                 )
                 if candidate is None or candidate["ask"] <= 0:
+                    continue
+                if dte_idx < MIN_ENTRY_DTE_INDEX:
                     continue
                 required = (
                     float(candidate["ask"]) * (1.0 + self.env.slippage)
@@ -279,14 +285,21 @@ class RiskManagedPPOEnv(gym.Wrapper):
         reward -= float(info.get("drawdown", 0.0)) * DRAWDOWN_REWARD_PENALTY
         if self.env.position is not None:
             remaining = max(int(self.env.position.expiry_t) - int(self.env.t), 0)
-            reward -= HOLDING_DECAY_PENALTY * (1.0 / max(remaining, 1))
+            if remaining <= 35:
+                reward -= HOLDING_DECAY_PENALTY * (36 - remaining) / 36.0
 
-        # Explicitly discourage letting short-lived long options drift to
-        # expiration. Expiry itself is valid, but with sparse historical quotes
-        # it can turn into a full premium loss before the policy learns to exit.
+        # Penalize expiry according to the actual premium loss.
         new_trades = self.env.trade_log[-1:] if self.env.trade_log else []
         if new_trades and new_trades[0].get("reason") == "expiry":
-            reward -= 0.02
+            trade = new_trades[0]
+            premium_at_entry = max(
+                float(trade.get("entry_price", 0.0))
+                * float(trade.get("contracts", 1))
+                * float(self.env.multiplier),
+                1e-9,
+            )
+            loss_fraction = max(0.0, -float(trade.get("pnl", 0.0))) / premium_at_entry
+            reward -= EXPIRY_REWARD_PENALTY + min(0.05, 0.05 * loss_fraction)
 
         if self.last_rejected:
             reward -= INVALID_ACTION_PENALTY
