@@ -98,7 +98,7 @@ class OptionsTradingEnv(gym.Env):
         self.n_features = len(self.feature_cols) + 1
 
         self.candidate_count = 2 * len(STRIKE_OFFSETS) * len(DTE_DAYS)
-        self.context_size = 8 + 8 + 5 + self.candidate_count * 5
+        self.context_size = 8 + 8 + 9 + self.candidate_count * 5
         self.action_space = spaces.MultiDiscrete(
             [4, 2, len(STRIKE_OFFSETS), len(DTE_DAYS), len(CONTRACT_SIZES)]
         )
@@ -390,14 +390,30 @@ class OptionsTradingEnv(gym.Env):
 
         spot = float(self.prices[decision_t])
         vol = self._vol(decision_t)
-        current_position_option = [0.0] * 5
+        current_position_option = [0.0] * 9
         if self.position is not None:
             call = self.position.kind in (1, 2)
-            greeks = self._option_greeks(spot, self.position.strike, max(self.position.expiry_t - decision_t, 0), vol, call)
+            remaining_steps = max(self.position.expiry_t - decision_t, 0)
+            greeks = self._option_greeks(
+                spot, self.position.strike, remaining_steps, vol, call
+            )
+            mark = float(self._mark(decision_t))
+            entry = max(float(self.position.entry_price), 1e-9)
+            mark_return = (mark - entry) / entry
+            entry_premium_vs_spot = entry / max(spot, 1e-9)
+            moneyness = spot / max(float(self.position.strike), 1e-9) - 1.0
+            time_in_trade = max(decision_t - int(self.position.entry_t), 0) / max(self.episode_hours, 1)
+            remaining_dte = remaining_steps / (30.0 * 7.0)
             current_position_option = [
-                greeks[0] / max(spot, 1e-9), greeks[1],
-                greeks[2] * spot, greeks[3] / max(spot, 1e-9),
-                greeks[4] / max(spot, 1e-9),
+                mark_return,
+                entry_premium_vs_spot,
+                moneyness,
+                time_in_trade,
+                remaining_dte,
+                greeks[0] / max(spot, 1e-9),
+                greeks[1],
+                greeks[2] * spot,
+                greeks[3] / max(spot, 1e-9),
             ]
 
         candidates = []
