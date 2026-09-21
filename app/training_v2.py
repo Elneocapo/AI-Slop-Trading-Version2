@@ -23,6 +23,7 @@ MAX_TRADE_RISK_PCT = 0.10
 INVALID_ACTION_PENALTY = 0.01
 NO_POSITION_CLOSE_PENALTY = 0.002
 DRAWDOWN_REWARD_PENALTY = 0.01
+HOLDING_DECAY_PENALTY = 0.0005
 
 
 def make_env(data, option_panel=None, fixed_start=None, episode_hours=EPISODE_HOURS):
@@ -276,6 +277,9 @@ class RiskManagedPPOEnv(gym.Wrapper):
         pre_equity = max(pre_equity, 1e-9)
         reward = float(np.log(post_equity / pre_equity))
         reward -= float(info.get("drawdown", 0.0)) * DRAWDOWN_REWARD_PENALTY
+        if self.env.position is not None:
+            remaining = max(int(self.env.position.expiry_t) - int(self.env.t), 0)
+            reward -= HOLDING_DECAY_PENALTY * (1.0 / max(remaining, 1))
 
         # Explicitly discourage letting short-lived long options drift to
         # expiration. Expiry itself is valid, but with sparse historical quotes
