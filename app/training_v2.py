@@ -26,6 +26,7 @@ DRAWDOWN_REWARD_PENALTY = 0.01
 HOLDING_DECAY_PENALTY = 0.0015
 EXPIRY_REWARD_PENALTY = 0.03
 MIN_ENTRY_DTE_INDEX = 1  # Skip 1-DTE entries during policy learning.
+FORCED_EXIT_BEFORE_EXPIRY_STEPS = 7  # Never carry a long option into the final trading day.
 
 
 def make_env(data, option_panel=None, fixed_start=None, episode_hours=EPISODE_HOURS):
@@ -161,7 +162,15 @@ class RiskManagedPPOEnv(gym.Wrapper):
         mask = np.zeros(self.ACTION_COUNT, dtype=bool)
         mask[0] = True  # HOLD is always valid.
         if self.env.position is not None:
-            mask[1] = True  # CLOSE is valid only while a position is open.
+            remaining = max(int(self.env.position.expiry_t) - int(self.env.t), 0)
+            if remaining <= FORCED_EXIT_BEFORE_EXPIRY_STEPS:
+                # Expiry is a hard risk boundary: force the policy to liquidate
+                # before the final trading day rather than learning to accept
+                # near-total premium loss at expiry.
+                mask[:] = False
+                mask[1] = True
+            else:
+                mask[1] = True  # CLOSE is valid while a position is open.
         elif getattr(self.env, "real_option_mode", False):
             decision_t = max(self.env.t - 1, 0)
             if self.env.is_regular_session(decision_t):
@@ -273,6 +282,10 @@ class RiskManagedPPOEnv(gym.Wrapper):
         return np.array([1, option_type, strike_idx, dte_idx, allowed_size_idx], dtype=np.int64)
 
     def step(self, action):
+        if self.env.position is not None:
+            remaining = max(int(self.env.position.expiry_t) - int(self.env.t), 0)
+            if remaining <= FORCED_EXIT_BEFORE_EXPIRY_STEPS:
+                action = 1
         translated = self._translate(action)
         pre_equity = float(self.env._equity(max(self.env.t - 1, 0)))
         obs, reward, terminated, truncated, info = self.env.step(translated)
