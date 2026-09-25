@@ -118,6 +118,7 @@ class OptionsTradingEnv(gym.Env):
         self.peak_equity = self.initial_cash
         self.trade_log: list[dict] = []
         self.total_transaction_costs = 0.0
+        self._candidate_observation_cache: dict[int, list[float]] = {}
 
     @staticmethod
     def _norm_cdf(x: float) -> float:
@@ -353,6 +354,7 @@ class OptionsTradingEnv(gym.Env):
         self.peak_equity = self.initial_cash
         self.trade_log = []
         self.total_transaction_costs = 0.0
+        self._candidate_observation_cache.clear()
         return self._observation(), {}
 
     def _observation(self):
@@ -416,31 +418,34 @@ class OptionsTradingEnv(gym.Env):
                 greeks[3] / max(spot, 1e-9),
             ]
 
-        candidates = []
-        for call in (True, False):
-            for offset in STRIKE_OFFSETS:
-                strike = self._strike_from_offset(spot, offset)
-                for dte_days in DTE_DAYS:
-                    candidate = self._get_candidate_contract(
-                        self.t,
-                        CALL if call else PUT,
-                        STRIKE_OFFSETS.index(offset),
-                        DTE_DAYS.index(dte_days),
-                    )
-                    if (
-                        candidate is None
-                        or candidate["expiry_t"] is None
-                        or candidate["ask"] <= 0.0
-                        or candidate["bid"] < 0.0
-                    ):
-                        candidates.extend([0.0] * 5)
-                    else:
-                        tau_hours = max(candidate["expiry_t"] - decision_t, 0)
-                        q = self._option_greeks(spot, candidate["strike"], tau_hours, vol, call)
-                        candidates.extend([
-                            candidate["ask"] / max(spot, 1e-9), q[1], q[2] * spot,
-                            q[3] / max(spot, 1e-9), q[4] / max(spot, 1e-9),
-                        ])
+        candidates = self._candidate_observation_cache.get(decision_t)
+        if candidates is None:
+            candidates = []
+            for call in (True, False):
+                for offset_idx, offset in enumerate(STRIKE_OFFSETS):
+                    strike = self._strike_from_offset(spot, offset)
+                    for dte_idx, dte_days in enumerate(DTE_DAYS):
+                        candidate = self._get_candidate_contract(
+                            self.t,
+                            CALL if call else PUT,
+                            offset_idx,
+                            dte_idx,
+                        )
+                        if (
+                            candidate is None
+                            or candidate["expiry_t"] is None
+                            or candidate["ask"] <= 0.0
+                            or candidate["bid"] < 0.0
+                        ):
+                            candidates.extend([0.0] * 5)
+                        else:
+                            tau_hours = max(candidate["expiry_t"] - decision_t, 0)
+                            q = self._option_greeks(spot, candidate["strike"], tau_hours, vol, call)
+                            candidates.extend([
+                                candidate["ask"] / max(spot, 1e-9), q[1], q[2] * spot,
+                                q[3] / max(spot, 1e-9), q[4] / max(spot, 1e-9),
+                            ])
+            self._candidate_observation_cache[decision_t] = candidates
 
         portfolio = [
             self.cash / self.initial_cash,
