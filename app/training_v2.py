@@ -19,7 +19,8 @@ from app.environment.real_options_env import RealOptionsTradingEnv
 EPISODE_HOURS = 145 * 7
 LOOKBACK = 60
 DEFAULT_TIMESTEPS = 5_000_000
-MAX_TRADE_RISK_PCT = 0.10
+MAX_TRADE_RISK_PCT = 0.05
+MAX_ROUNDTRIP_COST_PCT = 0.12  # Avoid contracts where fees/slippage dominate the premium.
 INVALID_ACTION_PENALTY = 0.01
 NO_POSITION_CLOSE_PENALTY = 0.002
 DRAWDOWN_REWARD_PENALTY = 0.01
@@ -150,11 +151,12 @@ class RiskManagedPPOEnv(gym.Wrapper):
         )
         if candidate is None or float(candidate.get("ask", 0.0)) <= 0:
             return False
-        required = (
-            float(candidate["ask"]) * (1.0 + self.env.slippage)
-            * self.env.multiplier
-            + self.env.transaction_cost
-        )
+        ask = float(candidate["ask"])
+        required = ask * (1.0 + self.env.slippage) * self.env.multiplier + self.env.transaction_cost
+        roundtrip_cost = 2.0 * self.env.transaction_cost
+        premium_notional = ask * self.env.multiplier
+        if premium_notional <= 0 or roundtrip_cost > premium_notional * MAX_ROUNDTRIP_COST_PCT:
+            return False
         return required <= budget and required <= float(self.env.cash)
 
     def action_masks(self):
@@ -207,12 +209,15 @@ class RiskManagedPPOEnv(gym.Wrapper):
                     continue
                 if dte_idx < MIN_ENTRY_DTE_INDEX:
                     continue
-                required = (
-                    float(candidate["ask"]) * (1.0 + self.env.slippage)
-                    * self.env.multiplier
-                    + self.env.transaction_cost
-                )
-                if required <= risk_budget and required <= float(self.env.cash):
+                ask = float(candidate["ask"])
+                required = ask * (1.0 + self.env.slippage) * self.env.multiplier + self.env.transaction_cost
+                premium_notional = ask * self.env.multiplier
+                if (
+                    premium_notional > 0
+                    and 2.0 * self.env.transaction_cost <= premium_notional * MAX_ROUNDTRIP_COST_PCT
+                    and required <= risk_budget
+                    and required <= float(self.env.cash)
+                ):
                     if best is None or required < best[0]:
                         best = (required, strike_idx, dte_idx)
         return best
@@ -274,7 +279,13 @@ class RiskManagedPPOEnv(gym.Wrapper):
             * self.env.multiplier * final_contracts
             + self.env.transaction_cost
         )
-        if final_required > risk_budget or final_required > float(self.env.cash):
+        premium_notional = float(candidate["ask"]) * self.env.multiplier
+        if (
+            premium_notional <= 0
+            or 2.0 * self.env.transaction_cost > premium_notional * MAX_ROUNDTRIP_COST_PCT
+            or final_required > risk_budget
+            or final_required > float(self.env.cash)
+        ):
             self.last_rejected = True
             self.last_invalid_reason = "final_risk_guard"
             return np.array([0, option_type, strike_idx, dte_idx, 0], dtype=np.int64)
@@ -704,6 +715,7 @@ def train(ticker: str, timesteps: int = DEFAULT_TIMESTEPS, period: str = "730d",
     if r["open_position"]:
         print(f"Open-position unrealized P&L: €{r['open_position_unrealized_pnl']:,.2f}")
     print(f"Risk limit: min({MAX_TRADE_RISK_PCT * 100:.0f}% current equity, {MAX_TRADE_RISK_PCT * 100:.0f}% initial capital) per new position")
+    print(f"Fee filter: round-trip transaction costs <= {MAX_ROUNDTRIP_COST_PCT * 100:.0f}% of option premium")
     baselines = evaluate_baselines(test_data)
     print(f"Baseline cash return: {baselines['cash_return_pct']:.2f}%")
     print(f"Underlying buy&hold return: {baselines['underlying_buy_hold_return_pct']:.2f}%")
