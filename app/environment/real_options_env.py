@@ -127,6 +127,7 @@ class RealOptionsTradingEnv(OptionsTradingEnv):
                 symbol=candidate["symbol"],
                 expiry_ts=candidate["expiry_ts"],
             )
+            self.position.entry_spot = float(self.data.loc[max(self.t - 1, 0), "Close"])
         elif operation == OPEN_SHORT:
             return
 
@@ -184,6 +185,11 @@ class RealOptionsTradingEnv(OptionsTradingEnv):
             "reason": reason,
             "transaction_costs": 2.0 * self.transaction_cost,
             "symbol": position.symbol,
+            "entry_spot": float(getattr(position, "entry_spot", np.nan)),
+            "entry_moneyness": (
+                float(position.strike) / float(getattr(position, "entry_spot", np.nan)) - 1.0
+                if float(getattr(position, "entry_spot", np.nan)) > 0 else np.nan
+            ),
         })
         self.position = None
 
