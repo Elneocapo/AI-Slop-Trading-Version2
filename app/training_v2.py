@@ -297,34 +297,30 @@ class RiskManagedPPOEnv(gym.Wrapper):
             remaining = max(int(self.env.position.expiry_t) - int(self.env.t), 0)
             if remaining <= FORCED_EXIT_BEFORE_EXPIRY_STEPS:
                 action = 1
+
         translated = self._translate(action)
-        pre_equity = float(self.env._equity(max(self.env.t - 1, 0)))
-        obs, reward, terminated, truncated, info = self.env.step(translated)
+        trades_before = len(self.env.trade_log)
+        obs, _, terminated, truncated, info = self.env.step(translated)
 
-        # Use a bounded, risk-aware learning signal. Equity change remains the
-        # primary objective, while drawdown receives a small continuous penalty.
-        post_equity = max(float(self.env.equity), 1e-9)
-        pre_equity = max(pre_equity, 1e-9)
-        reward = float(np.log(post_equity / pre_equity))
-        reward -= float(info.get("drawdown", 0.0)) * DRAWDOWN_REWARD_PENALTY
-        if self.env.position is not None:
-            remaining = max(int(self.env.position.expiry_t) - int(self.env.t), 0)
-            if remaining <= 35:
-                reward -= HOLDING_DECAY_PENALTY * (36 - remaining) / 36.0
+        # The primary learning signal is realized P&L. Opening a position does
+        # not receive an immediate reward: the agent must wait until CLOSE,
+        # expiry, or a risk-stop liquidation to discover whether that decision
+        # was profitable. This avoids teaching PPO that HOLD is inherently
+        # better simply because an OPEN incurs entry costs immediately.
+        reward = 0.0
+        new_trades = self.env.trade_log[trades_before:]
+        if new_trades:
+            realized_pnl = sum(float(trade.get("pnl", 0.0)) for trade in new_trades)
+            reward = realized_pnl / max(float(self.env.initial_cash), 1.0)
 
-        # Penalize expiry according to the actual premium loss.
-        new_trades = self.env.trade_log[-1:] if self.env.trade_log else []
-        if new_trades and new_trades[0].get("reason") == "expiry":
-            trade = new_trades[0]
-            premium_at_entry = max(
-                float(trade.get("entry_price", 0.0))
-                * float(trade.get("contracts", 1))
-                * float(self.env.multiplier),
-                1e-9,
-            )
-            loss_fraction = max(0.0, -float(trade.get("pnl", 0.0))) / premium_at_entry
-            reward -= EXPIRY_REWARD_PENALTY + min(0.05, 0.05 * loss_fraction)
+            # Small additional penalty only when the account actually reaches
+            # the hard drawdown stop. Ordinary mark-to-market drawdowns do not
+            # create a separate reward stream.
+            if info.get("risk_stop", False):
+                reward -= DRAWDOWN_REWARD_PENALTY * float(info.get("drawdown", 0.0))
 
+        # Invalid/rejected actions remain penalized so the policy does not learn
+        # to spam actions that the environment cannot execute.
         if self.last_rejected:
             reward -= INVALID_ACTION_PENALTY
         elif self.last_invalid_reason == "close_without_position":
@@ -334,6 +330,7 @@ class RiskManagedPPOEnv(gym.Wrapper):
         info["risk_rejected"] = bool(self.last_rejected)
         info["invalid_reason"] = self.last_invalid_reason
         info["decoded_action"] = self._decode(action)
+        info["realized_pnl_reward"] = float(reward)
         return obs, float(reward), terminated, truncated, info
 
 
