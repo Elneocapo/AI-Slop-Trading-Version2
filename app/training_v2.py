@@ -23,8 +23,14 @@ MAX_TRADE_RISK_PCT = 0.05
 MAX_ROUNDTRIP_COST_PCT = 0.12  # Avoid contracts where fees/slippage dominate the premium.
 INVALID_ACTION_PENALTY = 0.01
 NO_POSITION_CLOSE_PENALTY = 0.002
-DRAWDOWN_REWARD_PENALTY = 0.01
+DRAWDOWN_REWARD_PENALTY = 0.05
 HOLDING_DECAY_PENALTY = 0.0015
+REWARD_PNL_SCALE = 50.0  # Compress rare outsized winners so one trade cannot dominate PPO.
+LOSS_STREAK_PENALTY = 0.015  # Additional penalty for consecutive losing realized trades.
+MAX_LOSS_STREAK_FOR_PENALTY = 3
+OTM_PENALTY_START = 0.05  # 5% OTM is tolerated before reward shaping begins.
+OTM_PENALTY_RATE = 0.40
+MAX_OTM_PENALTY = 0.08
 EXPIRY_REWARD_PENALTY = 0.03
 MIN_ENTRY_DTE_INDEX = 1  # Skip 1-DTE entries during policy learning.
 FORCED_EXIT_BEFORE_EXPIRY_STEPS = 7  # Never carry a long option into the final trading day.
@@ -248,7 +254,6 @@ class RiskManagedPPOEnv(gym.Wrapper):
             self.last_rejected = True
             self.last_invalid_reason = "risk_budget_too_small"
             return np.array([0, option_type, strike_idx, dte_idx, 0], dtype=np.int64)
-
         candidate = self.env._get_candidate_contract(
             self.env.t, option_type, strike_idx, dte_idx
         )
@@ -302,20 +307,45 @@ class RiskManagedPPOEnv(gym.Wrapper):
         trades_before = len(self.env.trade_log)
         obs, _, terminated, truncated, info = self.env.step(translated)
 
-        # The primary learning signal is realized P&L. Opening a position does
-        # not receive an immediate reward: the agent must wait until CLOSE,
-        # expiry, or a risk-stop liquidation to discover whether that decision
-        # was profitable. This avoids teaching PPO that HOLD is inherently
-        # better simply because an OPEN incurs entry costs immediately.
+        # Keep the main signal tied to realized trade outcomes, but compress
+        # extreme P&L so a single lottery-style option winner cannot dominate
+        # the policy gradient. PPO still sees the direction and relative quality
+        # of the trade, while repeated small losses remain meaningful.
         reward = 0.0
         new_trades = self.env.trade_log[trades_before:]
         if new_trades:
             realized_pnl = sum(float(trade.get("pnl", 0.0)) for trade in new_trades)
-            reward = realized_pnl / max(float(self.env.initial_cash), 1.0)
+            reward = float(np.tanh(realized_pnl / REWARD_PNL_SCALE))
 
-            # Small additional penalty only when the account actually reaches
-            # the hard drawdown stop. Ordinary mark-to-market drawdowns do not
-            # create a separate reward stream.
+            # Penalize ordinary drawdown when a trade is realized, not only when
+            # the hard 25% circuit breaker fires.
+            current_drawdown = max(float(info.get("drawdown", 0.0)), 0.0)
+            reward -= DRAWDOWN_REWARD_PENALTY * current_drawdown
+
+            # A sequence of losing trades is worse than the same losses
+            # separated by profitable decisions. Cap the shaping term so it
+            # cannot overwhelm the realized-P&L signal.
+            trailing_losses = 0
+            for trade in reversed(self.env.trade_log):
+                if float(trade.get("pnl", 0.0)) < 0:
+                    trailing_losses += 1
+                else:
+                    break
+            streak_penalty = LOSS_STREAK_PENALTY * min(
+                trailing_losses, MAX_LOSS_STREAK_FOR_PENALTY
+            )
+            reward -= streak_penalty
+
+            # For the real OPRA environment, penalize chasing materially OTM
+            # contracts. This is deliberately soft and starts only beyond 5%
+            # OTM, so the agent can still learn useful slightly-OTM CALLs/PUTs.
+            for trade in new_trades:
+                entry_moneyness = trade.get("entry_moneyness")
+                if entry_moneyness is None or pd.isna(entry_moneyness):
+                    continue
+                otm_distance = max(abs(float(entry_moneyness)) - OTM_PENALTY_START, 0.0)
+                reward -= min(MAX_OTM_PENALTY, otm_distance * OTM_PENALTY_RATE)
+
             if info.get("risk_stop", False):
                 reward -= DRAWDOWN_REWARD_PENALTY * float(info.get("drawdown", 0.0))
 
@@ -497,8 +527,7 @@ def evaluate(model, data: pd.DataFrame, report_dir: Path | None = None, option_p
         "worst_trade": float(min(trade_pnls, default=0.0)),
         "open_position": env.position is not None,
         "open_position_unrealized_pnl": (
-            float((env.env._mark(env.env.t) - env.position.entry_price) * env.env.multiplier * env.position.contracts)
-            if env.position is not None else 0.0
+            float((env.env._mark(env.env.t) - env.position.entry_price) * env.env.multiplier * env.position.contracts)            if env.position is not None else 0.0
         ),
         "action_counts": action_counts,
         "risk_rejected": rejected,
@@ -798,21 +827,3 @@ def main():
         print("\n=== OOS SEGMENT CHECK (SAME 145-DAY OOS PERIOD) ===")
         for w in windows:
             print(
-                f"Segment {w['segment']}: return {w['return_pct']:.2f}% | "
-                f"buy&hold {w['buy_hold_return_pct']:.2f}% | "
-                f"max DD {w['max_drawdown_pct']:.2f}% | "
-                f"trades {w['trades']} | win rate {w['win_rate_pct']:.2f}%"
-            )
-    else:
-        train(
-            ticker,
-            a.timesteps,
-            a.period,
-            a.resume,
-            data_source=a.data_source,
-            options_file=a.options_file,
-        )
-
-
-if __name__ == "__main__":
-    main()
