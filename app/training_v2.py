@@ -343,7 +343,17 @@ class RiskManagedPPOEnv(gym.Wrapper):
                 entry_moneyness = trade.get("entry_moneyness")
                 if entry_moneyness is None or pd.isna(entry_moneyness):
                     continue
-                otm_distance = max(abs(float(entry_moneyness)) - OTM_PENALTY_START, 0.0)
+                # entry_moneyness is strike/spot - 1.0:
+                #   CALL: positive => OTM (strike above spot)
+                #   PUT:   negative => OTM (strike below spot)
+                # Do not use abs(), because that would also penalize ITM options.
+                kind = int(trade.get("kind", 0))
+                if kind == 1:
+                    otm_distance = max(float(entry_moneyness) - OTM_PENALTY_START, 0.0)
+                elif kind == -1:
+                    otm_distance = max(-float(entry_moneyness) - OTM_PENALTY_START, 0.0)
+                else:
+                    otm_distance = 0.0
                 reward -= min(MAX_OTM_PENALTY, otm_distance * OTM_PENALTY_RATE)
 
             if info.get("risk_stop", False):
@@ -798,50 +808,3 @@ def main():
             f"Action distribution: HOLD {r['action_counts']['hold']} | CLOSE {r['action_counts']['close']} | "
             f"OPEN_CALL {r['action_counts']['open_call']} | OPEN_PUT {r['action_counts']['open_put']}"
         )
-        print(f"Risk-rejected actions: {r['risk_rejected']}")
-        print(f"Invalid-action reasons: {r['invalid_reasons']}")
-        print(f"Max entry cost observed: €{r['max_entry_notional']:,.2f}")
-        print(f"Open position at test end: {'YES' if r['open_position'] else 'NO'}")
-        print(f"Risk limit: min({MAX_TRADE_RISK_PCT * 100:.0f}% current equity, {MAX_TRADE_RISK_PCT * 100:.0f}% initial capital) per new position")
-        baselines = evaluate_baselines(test_data)
-        print(f"Baseline cash return: {baselines['cash_return_pct']:.2f}%")
-        print(f"Underlying buy&hold return: {baselines['underlying_buy_hold_return_pct']:.2f}%")
-        ranked = sorted(r["trades"], key=lambda t: float(t["pnl"]), reverse=True)
-        print("Top 3 trades:")
-        for trade in ranked[:3]:
-            print(
-                f"  P&L €{float(trade['pnl']):,.2f} | strike {float(trade['strike']):.2f} | "
-                f"contracts {int(trade['contracts'])} | entry €{float(trade['entry_price']):.4f} | "
-                f"exit €{float(trade['exit_price']):.4f} | {trade['reason']}"
-            )
-        print("Bottom 3 trades:")
-        for trade in ranked[-3:]:
-            print(
-                f"  P&L €{float(trade['pnl']):,.2f} | strike {float(trade['strike']):.2f} | "
-                f"contracts {int(trade['contracts'])} | entry €{float(trade['entry_price']):.4f} | "
-                f"exit €{float(trade['exit_price']):.4f} | {trade['reason']}"
-            )
-        windows = evaluate_oos_segments(model, test_data, option_panel=option_panel)
-        pd.DataFrame(windows).to_csv(Path("training_eval") / "latest_oos" / "oos_multi_window_audit.csv", index=False)
-        print("OOS audit files: training_eval\\latest_oos")
-        print("\n=== OOS SEGMENT CHECK (SAME 145-DAY OOS PERIOD) ===")
-        for w in windows:
-            print(
-                f"Segment {w['segment']}: return {w['return_pct']:.2f}% | "
-                f"buy&hold {w['buy_hold_return_pct']:.2f}% | "
-                f"max DD {w['max_drawdown_pct']:.2f}% | "
-                f"trades {w['trades']} | win rate {w['win_rate_pct']:.2f}%"
-            )
-    else:
-        train(
-            ticker,
-            a.timesteps,
-            a.period,
-            a.resume,
-            data_source=a.data_source,
-            options_file=a.options_file,
-        )
-
-
-if __name__ == "__main__":
-    main()
