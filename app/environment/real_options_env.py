@@ -52,8 +52,9 @@ class RealOptionsTradingEnv(OptionsTradingEnv):
 
         self.option_panel = panel
         self._expiry_cache: dict[str, int | None] = {}
-        self._candidate_quotes: dict[tuple[str, int], dict[str, Any]] = {}
-        self._symbol_quotes: dict[tuple[str, str], tuple[float, float]] = {}
+        self._candidate_quotes: dict[tuple[int, int], dict[str, Any]] = {}
+        self._candidate_times: dict[int, list[int]] = {}
+        self._symbol_quotes: dict[tuple[int, str], tuple[float, float]] = {}
         for row in panel.itertuples(index=False):
             expiry_t = self._find_expiry_index(row.expiry)
             record = {
@@ -66,8 +67,14 @@ class RealOptionsTradingEnv(OptionsTradingEnv):
                 "mid": (float(row.bid) + float(row.ask)) / 2.0,
                 "option_type": CALL if str(row.option_type).upper() == "CALL" else 1,
             }
-            self._candidate_quotes[(row.timestamp_key, int(row.candidate_idx))] = record
-            self._symbol_quotes[(row.timestamp_key, str(row.symbol))] = (float(row.bid), float(row.ask))
+            candidate_idx = int(row.candidate_idx)
+            timestamp_key = int(row.timestamp_key)
+            self._candidate_quotes[(timestamp_key, candidate_idx)] = record
+            self._candidate_times.setdefault(candidate_idx, []).append(timestamp_key)
+            self._symbol_quotes[(timestamp_key, str(row.symbol))] = (float(row.bid), float(row.ask))
+
+        for candidate_idx in self._candidate_times:
+            self._candidate_times[candidate_idx] = sorted(set(self._candidate_times[candidate_idx]))
 
         self.real_option_mode = True
 
@@ -101,7 +108,24 @@ class RealOptionsTradingEnv(OptionsTradingEnv):
             + int(strike_idx) * len(DTE_DAYS)
             + int(dte_idx)
         )
-        return self._candidate_quotes.get((timestamp_key, candidate_idx))
+        exact = self._candidate_quotes.get((timestamp_key, candidate_idx))
+        if exact is not None:
+            return exact
+
+        # Yahoo hourly bars and OPRA resampled quotes can differ slightly in
+        # timestamp. Use only the latest quote at or before the decision bar;
+        # never use a future quote.
+        times = self._candidate_times.get(candidate_idx, [])
+        if not times:
+            return None
+        pos = bisect_right(times, timestamp_key) - 1
+        if pos < 0:
+            return None
+        quote_key = times[pos]
+        # Do not carry a stale quote across more than one trading hour.
+        if timestamp_key - quote_key > 60 * 60 * 1_000_000_000:
+            return None
+        return self._candidate_quotes.get((quote_key, candidate_idx))
 
     def _position_bid_ask(self, t: int) -> tuple[float, float]:
         if self.position is None or self.position.symbol is None:
