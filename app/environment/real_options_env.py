@@ -55,6 +55,7 @@ class RealOptionsTradingEnv(OptionsTradingEnv):
         self._expiry_cache: dict[str, int | None] = {}
         self._candidate_quotes: dict[tuple[int, int], dict[str, Any]] = {}
         self._candidate_times: dict[int, list[int]] = {}
+        self._timestamp_candidates: dict[int, list[dict[str, Any]]] = {}
         self._symbol_quotes: dict[tuple[int, str], tuple[float, float]] = {}
         for row in panel.itertuples(index=False):
             expiry_t = self._find_expiry_index(row.expiry)
@@ -70,8 +71,10 @@ class RealOptionsTradingEnv(OptionsTradingEnv):
             }
             candidate_idx = int(row.candidate_idx)
             timestamp_key = int(row.timestamp_key)
+            record["candidate_idx"] = candidate_idx
             self._candidate_quotes[(timestamp_key, candidate_idx)] = record
             self._candidate_times.setdefault(candidate_idx, []).append(timestamp_key)
+            self._timestamp_candidates.setdefault(timestamp_key, []).append(record)
             self._symbol_quotes[(timestamp_key, str(row.symbol))] = (float(row.bid), float(row.ask))
 
         for candidate_idx in self._candidate_times:
@@ -125,8 +128,61 @@ class RealOptionsTradingEnv(OptionsTradingEnv):
         quote_key = times[pos]
         # Do not carry a stale quote across more than one trading hour.
         if timestamp_key - quote_key > 60 * 60 * 1_000_000_000:
+            quote_key = None
+        else:
+            candidate = self._candidate_quotes.get((quote_key, candidate_idx))
+            if candidate is not None:
+                return candidate
+
+        # The processed panel assigns candidate_idx using the contract selected
+        # at the start of each trading day. Some historical quote streams can
+        # lose that exact mapping after timestamp normalization/resampling.
+        # Fall back to the real quote closest to the requested strike/DTE at the
+        # latest available quote timestamp <= decision_t. This remains strictly
+        # causal: no future quote can enter the candidate selection.
+        all_times = sorted(self._timestamp_candidates)
+        pos = bisect_right(all_times, timestamp_key) - 1
+        if pos < 0:
             return None
-        return self._candidate_quotes.get((quote_key, candidate_idx))
+        fallback_key = all_times[pos]
+        if timestamp_key - fallback_key > 60 * 60 * 1_000_000_000:
+            return None
+
+        decision_t = max(int(t) - 1, 0)
+        spot = float(self.data.loc[decision_t, "Close"])
+        target_strike = self._strike_from_offset(
+            spot, STRIKE_OFFSETS[int(strike_idx)]
+        )
+        target_dte = int(DTE_DAYS[int(dte_idx)])
+        decision_date = pd.Timestamp(
+            self.data.loc[decision_t, "timestamp"]
+        ).date()
+
+        best = None
+        best_score = float("inf")
+        for record in self._timestamp_candidates.get(fallback_key, []):
+            if int(record.get("option_type", -1)) != int(option_type):
+                continue
+            if float(record.get("ask", 0.0)) <= 0:
+                continue
+            expiry_t = record.get("expiry_t")
+            if expiry_t is None:
+                continue
+            expiry_ts = record.get("expiry_ts")
+            try:
+                expiry_date = pd.Timestamp(expiry_ts).date()
+            except Exception:
+                continue
+            dte = max((expiry_date - decision_date).days, 0)
+            strike = float(record.get("strike", 0.0))
+            score = (
+                abs(strike - target_strike) / max(abs(spot), 1.0)
+                + abs(dte - target_dte) * 0.01
+            )
+            if score < best_score:
+                best_score = score
+                best = record
+        return best
 
     def _position_bid_ask(self, t: int) -> tuple[float, float]:
         if self.position is None or self.position.symbol is None:
