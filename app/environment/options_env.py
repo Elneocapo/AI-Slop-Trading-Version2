@@ -206,9 +206,16 @@ class OptionsTradingEnv(gym.Env):
         sqrt_tau = sqrt(tau)
         d1 = (log(max(spot, 1e-9) / max(strike, 1e-9)) + 0.5 * vol * vol * tau) / (vol * sqrt_tau)
         d2 = d1 - vol * sqrt_tau
-        price = self._option_price(spot, strike, tau_hours, vol, call)
+        nd1 = self._norm_cdf(d1)
+        nd2 = self._norm_cdf(d2)
+        theoretical = (
+            spot * nd1 - strike * nd2
+            if call
+            else strike * (1.0 - nd2) - spot * (1.0 - nd1)
+        )
+        price = self._round_option_price(theoretical)
         pdf = self._norm_pdf(d1)
-        delta = self._norm_cdf(d1) if call else self._norm_cdf(d1) - 1.0
+        delta = nd1 if call else nd1 - 1.0
         gamma = pdf / (max(spot, 1e-9) * vol * sqrt_tau)
         theta_hour = (-(spot * pdf * vol) / (2.0 * sqrt_tau)) / (7.0 * 252.0)
         vega = spot * pdf * sqrt_tau
