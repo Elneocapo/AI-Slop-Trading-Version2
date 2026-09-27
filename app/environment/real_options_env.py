@@ -67,7 +67,7 @@ class RealOptionsTradingEnv(OptionsTradingEnv):
                 "bid": float(row.bid),
                 "ask": float(row.ask),
                 "mid": (float(row.bid) + float(row.ask)) / 2.0,
-                "option_type": CALL if str(row.option_type).upper() == "CALL" else 1,
+                "option_type": (CALL if str(row.option_type).upper() in {"CALL", "C", "0"} else 1),
             }
             candidate_idx = int(row.candidate_idx)
             timestamp_key = int(row.timestamp_key)
@@ -145,9 +145,6 @@ class RealOptionsTradingEnv(OptionsTradingEnv):
         pos = bisect_right(all_times, timestamp_key) - 1
         if pos < 0:
             return None
-        fallback_key = all_times[pos]
-        if timestamp_key - fallback_key > 60 * 60 * 1_000_000_000:
-            return None
 
         decision_t = max(int(t) - 1, 0)
         spot = float(self.data.loc[decision_t, "Close"])
@@ -159,30 +156,55 @@ class RealOptionsTradingEnv(OptionsTradingEnv):
             self.data.loc[decision_t, "timestamp"]
         ).date()
 
+        # Search backward through several real quote timestamps. A single
+        # timestamp can be missing one side of the chain after OPRA filtering,
+        # while the previous hourly quote still contains a perfectly usable
+        # contract. Never inspect timestamps after the decision bar.
+        max_lookback_ns = 7 * 24 * 60 * 60 * 1_000_000_000
         best = None
         best_score = float("inf")
-        for record in self._timestamp_candidates.get(fallback_key, []):
-            if int(record.get("option_type", -1)) != int(option_type):
-                continue
-            if float(record.get("ask", 0.0)) <= 0:
-                continue
-            expiry_t = record.get("expiry_t")
-            if expiry_t is None:
-                continue
-            expiry_ts = record.get("expiry_ts")
-            try:
-                expiry_date = pd.Timestamp(expiry_ts).date()
-            except Exception:
-                continue
-            dte = max((expiry_date - decision_date).days, 0)
-            strike = float(record.get("strike", 0.0))
-            score = (
-                abs(strike - target_strike) / max(abs(spot), 1.0)
-                + abs(dte - target_dte) * 0.01
-            )
-            if score < best_score:
-                best_score = score
-                best = record
+        steps = 0
+        while pos >= 0:
+            fallback_key = all_times[pos]
+            age_ns = timestamp_key - fallback_key
+            if age_ns > max_lookback_ns:
+                break
+
+            for record in self._timestamp_candidates.get(fallback_key, []):
+                if int(record.get("option_type", -1)) != int(option_type):
+                    continue
+                if float(record.get("ask", 0.0)) <= 0:
+                    continue
+
+                expiry_ts = record.get("expiry_ts")
+                try:
+                    expiry_date = pd.Timestamp(expiry_ts).date()
+                except Exception:
+                    continue
+                dte = max((expiry_date - decision_date).days, 0)
+                if dte <= 0:
+                    continue
+
+                strike = float(record.get("strike", 0.0))
+                score = (
+                    age_ns / 3_600_000_000_000.0
+                    + abs(strike - target_strike) / max(abs(spot), 1.0)
+                    + abs(dte - target_dte) * 0.01
+                )
+                if score < best_score:
+                    best_score = score
+                    best = record
+
+            # Once we have inspected at least one prior trading-hours quote,
+            # prefer causality over an exact timestamp match and stop early
+            # when a close-enough strike/DTE candidate is found.
+            if best is not None and best_score < 0.20:
+                break
+            pos -= 1
+            steps += 1
+            if steps >= 500:
+                break
+
         return best
 
     def _position_bid_ask(self, t: int) -> tuple[float, float]:
