@@ -17,6 +17,7 @@ from app.environment.options_env import CALL, CONTRACT_SIZES, DTE_DAYS, STRIKE_O
 from app.environment.real_options_env import RealOptionsTradingEnv
 
 EPISODE_HOURS = 145 * 7
+VALIDATION_HOURS = 45 * 7  # Pre-OOS validation block used only for checkpoint selection.
 LOOKBACK = 60
 DEFAULT_TIMESTEPS = 5_000_000
 MAX_TRADE_RISK_PCT = 0.05
@@ -648,23 +649,41 @@ def train(ticker: str, timesteps: int = DEFAULT_TIMESTEPS, period: str = "730d",
     model_suffix = "_real" if data_source == "real" else "_alpaca" if data_source == "alpaca" else ""
     if data_source == "real":
         data = align_real_data_to_option_panel(data, option_panel)
-    if len(data) <= EPISODE_HOURS + LOOKBACK + 100:
-        raise ValueError("Not enough hourly history for training")
-    split = len(data) - EPISODE_HOURS - 1
-    train_data = data.iloc[:split].reset_index(drop=True)
-    test_data = data.iloc[split - LOOKBACK:].reset_index(drop=True)
+    minimum_required = EPISODE_HOURS + LOOKBACK + VALIDATION_HOURS + LOOKBACK + 2
+    if len(data) <= minimum_required:
+        raise ValueError(
+            f"Not enough hourly history. Need more than {minimum_required} candles "
+            "for training + validation + untouched OOS."
+        )
+    oos_split = len(data) - EPISODE_HOURS - 1
+    pre_oos = data.iloc[:oos_split].reset_index(drop=True)
+
+    # Keep the final 145-day OOS block completely untouched. A shorter
+    # pre-OOS validation block is reserved exclusively for checkpoint selection.
+    validation_start = len(pre_oos) - VALIDATION_HOURS - 1
+    fit_data = pre_oos.iloc[:validation_start].reset_index(drop=True)
+    validation_data = pre_oos.iloc[
+        validation_start - LOOKBACK:
+    ].reset_index(drop=True)
+    test_data = data.iloc[oos_split - LOOKBACK:].reset_index(drop=True)
+
+    if len(fit_data) <= EPISODE_HOURS + LOOKBACK:
+        raise ValueError(
+            "Not enough pre-OOS data left for a full 145-day training episode "
+            "after reserving the validation block."
+        )
 
     train_env = Monitor(
         RiskManagedPPOEnv(
-            make_env(train_data, option_panel=option_panel, episode_hours=EPISODE_HOURS)
+            make_env(fit_data, option_panel=option_panel, episode_hours=EPISODE_HOURS)
         )
     )
     eval_env = Monitor(
         RiskManagedPPOEnv(
             make_env(
-                test_data,
+                validation_data,
                 option_panel=option_panel,
-                episode_hours=EPISODE_HOURS,
+                episode_hours=VALIDATION_HOURS,
                 fixed_start=LOOKBACK,
             )
         )
@@ -731,6 +750,7 @@ def train(ticker: str, timesteps: int = DEFAULT_TIMESTEPS, period: str = "730d",
     report_dir = Path("training_eval") / "latest_oos"
     r = evaluate(model, test_data, report_dir=report_dir, option_panel=option_panel)
 
+    print(f"Validation block for checkpoint selection: {VALIDATION_HOURS} hourly steps (~45 trading days); final OOS remains untouched.")
     print("\n=== 145-DAY OUT-OF-SAMPLE TEST ===")
     print(f"Ticker: {ticker}\nLookback: {LOOKBACK} hourly candles\nEpisode: {EPISODE_HOURS} hourly steps (~145 trading days)")
     print("Initial capital: €500.00")
