@@ -83,6 +83,51 @@ class RealOptionsTradingEnv(OptionsTradingEnv):
 
         self.real_option_mode = True
 
+    def reset(self, *, seed=None, options=None):
+        """Reset on the first causally covered bar when using a real option panel."""
+        super().reset(seed=seed)
+        if not self.real_option_mode:
+            return self._observation(), {}
+
+        minimum_t = int(self.t)
+        max_t = min(
+            len(self.data) - self.episode_hours - 1,
+            minimum_t + 10 * 24 * 7,
+        )
+        selected_t = None
+        for candidate_t in range(minimum_t, max_t + 1):
+            decision_t = candidate_t - 1
+            if decision_t < self.lookback or not self.is_regular_session(decision_t):
+                continue
+            # Require at least one CALL or PUT quote with a valid DTE at/before
+            # the decision bar. This only moves the start forward; it never
+            # introduces a future quote into the state.
+            for option_type in (CALL, 1):
+                for strike_idx in range(len(STRIKE_OFFSETS)):
+                    for dte_idx in range(1, len(DTE_DAYS)):
+                        if self._get_candidate_contract(
+                            candidate_t, option_type, strike_idx, dte_idx
+                        ) is not None:
+                            selected_t = candidate_t
+                            break
+                    if selected_t is not None:
+                        break
+                if selected_t is not None:
+                    break
+            if selected_t is not None:
+                break
+
+        if selected_t is None:
+            raise ValueError(
+                "Real options panel has no causally available entry quote "
+                "inside the current episode window."
+            )
+
+        self.t = int(selected_t)
+        self.end_t = self.t + self.episode_hours
+        self._candidate_observation_cache.clear()
+        return self._observation(), {}
+
     @staticmethod
     def _timestamp_key(value) -> int:
         """Normalize timestamps to an absolute UTC key for quote lookup."""
