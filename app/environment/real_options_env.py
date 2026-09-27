@@ -42,7 +42,10 @@ class RealOptionsTradingEnv(OptionsTradingEnv):
         panel["strike"] = pd.to_numeric(panel["strike"], errors="coerce")
         panel = panel.dropna(subset=["timestamp", "candidate_idx", "symbol", "expiry", "strike", "bid", "ask"])
         panel = panel[(panel["bid"] >= 0) & (panel["ask"] > 0) & (panel["ask"] >= panel["bid"])]
-        panel["timestamp_key"] = panel["timestamp"].map(lambda x: x.isoformat())
+        # Use an absolute UTC nanosecond key instead of isoformat(). This keeps
+        # quote lookup stable when one side is represented as ET and the other
+        # as UTC (or uses a different but equivalent timezone offset).
+        panel["timestamp_key"] = panel["timestamp"].map(self._timestamp_key)
         panel["candidate_idx"] = panel["candidate_idx"].astype(int)
         panel["symbol"] = panel["symbol"].astype(str)
         panel = panel.drop_duplicates(["timestamp_key", "candidate_idx"], keep="last")
@@ -68,6 +71,16 @@ class RealOptionsTradingEnv(OptionsTradingEnv):
 
         self.real_option_mode = True
 
+    @staticmethod
+    def _timestamp_key(value) -> int:
+        """Normalize timestamps to an absolute UTC key for quote lookup."""
+        ts = pd.Timestamp(value)
+        if ts.tzinfo is None:
+            ts = ts.tz_localize("America/New_York")
+        else:
+            ts = ts.tz_convert("UTC")
+        return int(ts.value)
+
     def _find_expiry_index(self, expiry: pd.Timestamp) -> int | None:
         key = expiry.date().isoformat()
         if key in getattr(self, "_expiry_cache", {}):
@@ -81,14 +94,14 @@ class RealOptionsTradingEnv(OptionsTradingEnv):
 
     def _get_candidate_contract(self, t: int, option_type: int, strike_idx: int, dte_idx: int) -> dict | None:
         decision_t = max(int(t) - 1, 0)
-        timestamp = pd.Timestamp(self.data.loc[decision_t, "timestamp"]).isoformat()
+        timestamp_key = self._timestamp_key(self.data.loc[decision_t, "timestamp"])
         per_type = len(STRIKE_OFFSETS) * len(DTE_DAYS)
         candidate_idx = (
             int(option_type) * per_type
             + int(strike_idx) * len(DTE_DAYS)
             + int(dte_idx)
         )
-        return self._candidate_quotes.get((timestamp, candidate_idx))
+        return self._candidate_quotes.get((timestamp_key, candidate_idx))
 
     def _position_bid_ask(self, t: int) -> tuple[float, float]:
         if self.position is None or self.position.symbol is None:
@@ -96,7 +109,7 @@ class RealOptionsTradingEnv(OptionsTradingEnv):
         timestamps = pd.DatetimeIndex(self.data["timestamp"])
         start = min(max(int(t), 0), len(timestamps) - 1)
         for idx in range(start, max(start - 40, -1), -1):
-            key = pd.Timestamp(timestamps[idx]).isoformat()
+            key = self._timestamp_key(timestamps[idx])
             quote = self._symbol_quotes.get((key, self.position.symbol))
             if quote is not None:
                 return quote
@@ -200,5 +213,5 @@ class RealOptionsTradingEnv(OptionsTradingEnv):
 
     def has_entry_quotes(self, t: int) -> bool:
         decision_t = max(int(t) - 1, 0)
-        timestamp = pd.Timestamp(self.data.loc[decision_t, "timestamp"]).isoformat()
-        return any(key[0] == timestamp and value["ask"] > 0 for key, value in self._candidate_quotes.items())
+        timestamp_key = self._timestamp_key(self.data.loc[decision_t, "timestamp"])
+        return any(key[0] == timestamp_key and value["ask"] > 0 for key, value in self._candidate_quotes.items())
