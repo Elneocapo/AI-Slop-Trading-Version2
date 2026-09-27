@@ -124,6 +124,8 @@ class RiskManagedPPOEnv(gym.Wrapper):
         self.action_space = gym.spaces.Discrete(self.ACTION_COUNT)
         self.max_trade_risk_pct = float(max_trade_risk_pct)
         self.last_rejected = False
+        self._mask_cache_t = None
+        self._mask_cache = None
 
     @property
     def trade_log(self):
@@ -170,6 +172,13 @@ class RiskManagedPPOEnv(gym.Wrapper):
 
     def action_masks(self):
         """Return only actions that are valid *and executable*."""
+        if (
+            self._mask_cache_t == int(self.env.t)
+            and self._mask_cache is not None
+            and self.env.position is None
+        ):
+            return self._mask_cache.copy()
+
         mask = np.zeros(self.ACTION_COUNT, dtype=bool)
         mask[0] = True  # HOLD is always valid.
         if self.env.position is not None:
@@ -191,6 +200,9 @@ class RiskManagedPPOEnv(gym.Wrapper):
         else:
             for action in range(2, self.ACTION_COUNT):
                 mask[action] = self._action_affordable(action)
+        if self.env.position is None:
+            self._mask_cache_t = int(self.env.t)
+            self._mask_cache = mask.copy()
         return mask
 
     def _decode(self, action: int):
@@ -301,6 +313,8 @@ class RiskManagedPPOEnv(gym.Wrapper):
         return np.array([1, option_type, strike_idx, dte_idx, allowed_size_idx], dtype=np.int64)
 
     def step(self, action):
+        self._mask_cache_t = None
+        self._mask_cache = None
         if self.env.position is not None:
             remaining = max(int(self.env.position.expiry_t) - int(self.env.t), 0)
             if remaining <= FORCED_EXIT_BEFORE_EXPIRY_STEPS:
