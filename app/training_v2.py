@@ -31,7 +31,8 @@ MAX_LOSS_STREAK_FOR_PENALTY = 2
 OTM_PENALTY_START = 0.05  # 5% OTM is tolerated before reward shaping begins.
 OTM_PENALTY_RATE = 0.10
 MAX_OTM_PENALTY = 0.02
-TRADE_REWARD_WEIGHT = 0.05  # Small realized-trade bonus on top of dense hourly equity reward.
+TRADE_REWARD_WEIGHT = 1.0  # Realized trade outcome is the primary PPO signal.
+POSITION_MARK_REWARD_WEIGHT = 0.15  # Small dense signal only while a position is open.
 EXPIRY_REWARD_PENALTY = 0.03
 MIN_ENTRY_DTE_INDEX = 1  # Skip 1-DTE entries during policy learning.
 FORCED_EXIT_BEFORE_EXPIRY_STEPS = 7  # Never carry a long option into the final trading day.
@@ -323,19 +324,15 @@ class RiskManagedPPOEnv(gym.Wrapper):
 
         translated = self._translate(action)
         trades_before = len(self.env.trade_log)
+        had_position = self.env.position is not None
         obs, base_reward, terminated, truncated, info = self.env.step(translated)
 
-        # Keep the base environment's dense hourly equity reward. The previous
-        # wrapper discarded it on non-closing steps, creating an overly sparse
-        # learning signal and making PPO learn mostly from close events.
-        reward = float(base_reward)
-
-        # Add only a small realized-outcome bonus so trade quality is visible
-        # without overwhelming the mark-to-market equity signal.
+        # Primary signal: realized P&L on completed trades.
+        reward = 0.0
         new_trades = self.env.trade_log[trades_before:]
         if new_trades:
             realized_pnl = sum(float(trade.get("pnl", 0.0)) for trade in new_trades)
-            reward += TRADE_REWARD_WEIGHT * float(
+            reward = TRADE_REWARD_WEIGHT * float(
                 np.tanh(realized_pnl / REWARD_PNL_SCALE)
             )
 
@@ -349,8 +346,7 @@ class RiskManagedPPOEnv(gym.Wrapper):
                 trailing_losses, MAX_LOSS_STREAK_FOR_PENALTY
             )
 
-            # Keep the OTM preference soft rather than making it a large reward
-            # barrier. The hard risk and affordability gates remain unchanged.
+            # OTM shaping stays mild so it cannot suppress a direction.
             for trade in new_trades:
                 entry_moneyness = trade.get("entry_moneyness")
                 if entry_moneyness is None or pd.isna(entry_moneyness):
@@ -371,8 +367,14 @@ class RiskManagedPPOEnv(gym.Wrapper):
                     otm_distance * OTM_PENALTY_RATE,
                 )
 
-        # Invalid/rejected actions should almost never happen because they are
-        # masked. Keep only a small diagnostic penalty if one slips through.
+            if info.get("risk_stop", False):
+                reward -= DRAWDOWN_REWARD_PENALTY * float(info.get("drawdown", 0.0))
+
+        elif had_position:
+            # Small causal mark-to-market signal only while holding the chosen
+            # contract; realized P&L remains the dominant learning target.
+            reward = POSITION_MARK_REWARD_WEIGHT * float(base_reward)
+
         if self.last_rejected:
             reward -= INVALID_ACTION_PENALTY
         elif self.last_invalid_reason == "close_without_position":
