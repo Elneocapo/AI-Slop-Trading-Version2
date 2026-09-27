@@ -79,6 +79,7 @@ class RealOptionsTradingEnv(OptionsTradingEnv):
 
         for candidate_idx in self._candidate_times:
             self._candidate_times[candidate_idx] = sorted(set(self._candidate_times[candidate_idx]))
+        self._all_quote_times = sorted(self._timestamp_candidates)
 
         self.real_option_mode = True
 
@@ -140,7 +141,7 @@ class RealOptionsTradingEnv(OptionsTradingEnv):
         # Fall back to the real quote closest to the requested strike/DTE at the
         # latest available quote timestamp <= decision_t. This remains strictly
         # causal: no future quote can enter the candidate selection.
-        all_times = sorted(self._timestamp_candidates)
+        all_times = self._all_quote_times
         pos = bisect_right(all_times, timestamp_key) - 1
         if pos < 0:
             return None
