@@ -34,6 +34,7 @@ MAX_OTM_PENALTY = 0.08
 EXPIRY_REWARD_PENALTY = 0.03
 MIN_ENTRY_DTE_INDEX = 1  # Skip 1-DTE entries during policy learning.
 FORCED_EXIT_BEFORE_EXPIRY_STEPS = 7  # Never carry a long option into the final trading day.
+REAL_TRANSACTION_COST = 0.25  # Keep a €500 account tradable without removing the 5% risk cap.
 
 
 def make_env(data, option_panel=None, fixed_start=None, episode_hours=EPISODE_HOURS):
@@ -44,6 +45,8 @@ def make_env(data, option_panel=None, fixed_start=None, episode_hours=EPISODE_HO
         "episode_hours": episode_hours,
         "fixed_start": fixed_start,
     }
+    if option_panel is not None:
+        kwargs["transaction_cost"] = REAL_TRANSACTION_COST
     if option_panel is not None:
         kwargs["option_panel"] = option_panel
     return env_cls(data, **kwargs)
