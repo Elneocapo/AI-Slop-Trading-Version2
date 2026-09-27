@@ -53,12 +53,26 @@ class RealOptionsTradingEnv(OptionsTradingEnv):
         underlying = self.data[["timestamp", "Close"]].copy()
         underlying["timestamp"] = pd.to_datetime(underlying["timestamp"], errors="coerce")
         underlying = underlying.dropna(subset=["timestamp", "Close"]).sort_values("timestamp")
+
+        # pandas may retain different datetime resolutions (s/us/ns) after
+        # reading the Yahoo and OPRA-derived sources. Use one integer UTC key
+        # for the preprocessing join so merge_asof sees identical dtypes.
+        panel_for_alignment = panel.sort_values("timestamp").copy()
+        panel_for_alignment["_timestamp_align_ns"] = panel_for_alignment["timestamp"].map(
+            self._timestamp_key
+        )
+        underlying["_timestamp_align_ns"] = underlying["timestamp"].map(
+            self._timestamp_key
+        )
+        underlying = underlying.sort_values("_timestamp_align_ns")
+
         aligned = pd.merge_asof(
-            panel.sort_values("timestamp"),
-            underlying,
-            on="timestamp",
+            panel_for_alignment,
+            underlying[["_timestamp_align_ns", "Close"]],
+            on="_timestamp_align_ns",
             direction="backward",
         )
+        aligned = aligned.drop(columns=["_timestamp_align_ns"])
         spot_series = pd.to_numeric(aligned["Close"], errors="coerce")
         valid = spot_series.notna() & (spot_series > 0)
         aligned = aligned.loc[valid].copy()
