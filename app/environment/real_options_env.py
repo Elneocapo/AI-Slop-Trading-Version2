@@ -80,52 +80,61 @@ class RealOptionsTradingEnv(OptionsTradingEnv):
         for candidate_idx in self._candidate_times:
             self._candidate_times[candidate_idx] = sorted(set(self._candidate_times[candidate_idx]))
         self._all_quote_times = sorted(self._timestamp_candidates)
+        self._data_timestamp_keys = [self._timestamp_key(v) for v in self.data["timestamp"]]
+        self._latest_quote_time_cache: dict[int, int | None] = {}
+        self._candidate_lookup_cache: dict[tuple[int, int, int, int], dict[str, Any] | None] = {}
+        self._fallback_candidates_cache: dict[int, dict[tuple[int, int, int], dict[str, Any]]] = {}
 
         self.real_option_mode = True
 
     def reset(self, *, seed=None, options=None):
-        """Reset on the first causally covered bar when using a real option panel."""
+        """Reset on a causally covered bar without scanning candidate contracts."""
         super().reset(seed=seed)
         if not self.real_option_mode:
             return self._observation(), {}
 
-        minimum_t = int(self.t)
+        initial_t = int(self.t)
         max_t = min(
             len(self.data) - self.episode_hours - 1,
-            minimum_t + 10 * 24 * 7,
+            initial_t + 10 * 24 * 7,
         )
+        if not self._all_quote_times:
+            raise ValueError("Real options panel contains no usable quote timestamps.")
+
+        quote_pos = bisect_right(
+            self._all_quote_times, self._data_timestamp_keys[initial_t - 1]
+        ) - 1
+        if quote_pos < 0:
+            quote_pos = 0
+
         selected_t = None
-        for candidate_t in range(minimum_t, max_t + 1):
-            decision_t = candidate_t - 1
-            if decision_t < self.lookback or not self.is_regular_session(decision_t):
-                continue
-            # Require at least one CALL or PUT quote with a valid DTE at/before
-            # the decision bar. This only moves the start forward; it never
-            # introduces a future quote into the state.
-            for option_type in (CALL, 1):
-                for strike_idx in range(len(STRIKE_OFFSETS)):
-                    for dte_idx in range(1, len(DTE_DAYS)):
-                        if self._get_candidate_contract(
-                            candidate_t, option_type, strike_idx, dte_idx
-                        ) is not None:
-                            selected_t = candidate_t
-                            break
-                    if selected_t is not None:
-                        break
-                if selected_t is not None:
+        pos = initial_t
+        while pos <= max_t:
+            decision_key = self._data_timestamp_keys[pos - 1]
+            while (
+                quote_pos + 1 < len(self._all_quote_times)
+                and self._all_quote_times[quote_pos + 1] <= decision_key
+            ):
+                quote_pos += 1
+            if quote_pos >= 0:
+                quote_key = self._all_quote_times[quote_pos]
+                age_ns = decision_key - quote_key
+                if self.is_regular_session(pos - 1) and 0 <= age_ns <= 60 * 60 * 1_000_000_000:
+                    selected_t = pos
                     break
-            if selected_t is not None:
-                break
+            pos += 1
 
         if selected_t is None:
             raise ValueError(
-                "Real options panel has no causally available entry quote "
-                "inside the current episode window."
+                "Real options panel has no causally available entry quote inside the current episode window."
             )
 
         self.t = int(selected_t)
         self.end_t = self.t + self.episode_hours
         self._candidate_observation_cache.clear()
+        self._candidate_lookup_cache.clear()
+        self._fallback_candidates_cache.clear()
+        self._latest_quote_time_cache.clear()
         return self._observation(), {}
 
     @staticmethod
@@ -150,115 +159,94 @@ class RealOptionsTradingEnv(OptionsTradingEnv):
         return value
 
     def _get_candidate_contract(self, t: int, option_type: int, strike_idx: int, dte_idx: int) -> dict | None:
+        """Return a real quote using only information available at t-1."""
         decision_t = max(int(t) - 1, 0)
-        timestamp_key = self._timestamp_key(self.data.loc[decision_t, "timestamp"])
+        cache_key = (decision_t, int(option_type), int(strike_idx), int(dte_idx))
+        if cache_key in self._candidate_lookup_cache:
+            return self._candidate_lookup_cache[cache_key]
+
+        timestamp_key = self._data_timestamp_keys[decision_t]
         per_type = len(STRIKE_OFFSETS) * len(DTE_DAYS)
         candidate_idx = (
             int(option_type) * per_type
             + int(strike_idx) * len(DTE_DAYS)
             + int(dte_idx)
         )
+
         exact = self._candidate_quotes.get((timestamp_key, candidate_idx))
         if exact is not None:
+            self._candidate_lookup_cache[cache_key] = exact
             return exact
 
-        # Yahoo hourly bars and OPRA resampled quotes can differ slightly in
-        # timestamp. Use only the latest quote at or before the decision bar;
-        # never use a future quote.
         times = self._candidate_times.get(candidate_idx, [])
-        if not times:
-            return None
-        pos = bisect_right(times, timestamp_key) - 1
-        if pos < 0:
-            return None
-        quote_key = times[pos]
-        # Do not carry a stale quote across more than one trading hour.
-        if timestamp_key - quote_key > 60 * 60 * 1_000_000_000:
-            quote_key = None
-        else:
-            candidate = self._candidate_quotes.get((quote_key, candidate_idx))
-            if candidate is not None:
-                return candidate
+        if times:
+            pos = bisect_right(times, timestamp_key) - 1
+            if pos >= 0:
+                quote_key = times[pos]
+                if timestamp_key - quote_key <= 60 * 60 * 1_000_000_000:
+                    candidate = self._candidate_quotes.get((quote_key, candidate_idx))
+                    if candidate is not None:
+                        self._candidate_lookup_cache[cache_key] = candidate
+                        return candidate
 
-        # The processed panel assigns candidate_idx using the contract selected
-        # at the start of each trading day. Some historical quote streams can
-        # lose that exact mapping after timestamp normalization/resampling.
-        # Fall back to the real quote closest to the requested strike/DTE at the
-        # latest available quote timestamp <= decision_t. This remains strictly
-        # causal: no future quote can enter the candidate selection.
-        all_times = self._all_quote_times
-        pos = bisect_right(all_times, timestamp_key) - 1
-        if pos < 0:
+        # Fallback is cached per decision bar. We only scan the records from the
+        # single latest quote timestamp at or before t-1, never a long history.
+        quote_key = self._latest_quote_time_cache.get(timestamp_key)
+        if quote_key is None:
+            pos = bisect_right(self._all_quote_times, timestamp_key) - 1
+            quote_key = self._all_quote_times[pos] if pos >= 0 else None
+            self._latest_quote_time_cache[timestamp_key] = quote_key
+        if quote_key is None or timestamp_key - quote_key > 60 * 60 * 1_000_000_000:
+            self._candidate_lookup_cache[cache_key] = None
             return None
 
-        decision_t = max(int(t) - 1, 0)
-        spot = float(self.data.loc[decision_t, "Close"])
-        target_strike = self._strike_from_offset(
-            spot, STRIKE_OFFSETS[int(strike_idx)]
-        )
-        target_dte = int(DTE_DAYS[int(dte_idx)])
-        decision_date = pd.Timestamp(
-            self.data.loc[decision_t, "timestamp"]
-        ).date()
+        fallback_map = self._fallback_candidates_cache.get(decision_t)
+        if fallback_map is None:
+            spot = float(self.data.loc[decision_t, "Close"])
+            decision_date = pd.Timestamp(self.data.loc[decision_t, "timestamp"]).date()
+            fallback_map = {}
+            records = self._timestamp_candidates.get(quote_key, [])
+            for requested_type in (CALL, 1):
+                typed = [
+                    record for record in records
+                    if int(record.get("option_type", -1)) == requested_type
+                    and float(record.get("ask", 0.0)) > 0
+                    and record.get("expiry_t") is not None
+                ]
+                for requested_strike_idx, offset in enumerate(STRIKE_OFFSETS):
+                    target_strike = self._strike_from_offset(spot, offset)
+                    for requested_dte_idx, target_dte in enumerate(DTE_DAYS):
+                        best = None
+                        best_score = float("inf")
+                        for record in typed:
+                            try:
+                                expiry_date = pd.Timestamp(record["expiry_ts"]).date()
+                            except Exception:
+                                continue
+                            dte = max((expiry_date - decision_date).days, 0)
+                            if dte <= 0:
+                                continue
+                            score = (
+                                abs(float(record["strike"]) - target_strike) / max(abs(spot), 1.0)
+                                + abs(dte - int(target_dte)) * 0.01
+                            )
+                            if score < best_score:
+                                best_score = score
+                                best = record
+                        if best is not None:
+                            fallback_map[(requested_type, requested_strike_idx, requested_dte_idx)] = best
+            self._fallback_candidates_cache[decision_t] = fallback_map
 
-        # Search backward through several real quote timestamps. A single
-        # timestamp can be missing one side of the chain after OPRA filtering,
-        # while the previous hourly quote still contains a perfectly usable
-        # contract. Never inspect timestamps after the decision bar.
-        max_lookback_ns = 7 * 24 * 60 * 60 * 1_000_000_000
-        best = None
-        best_score = float("inf")
-        steps = 0
-        while pos >= 0:
-            fallback_key = all_times[pos]
-            age_ns = timestamp_key - fallback_key
-            if age_ns > max_lookback_ns:
-                break
-
-            for record in self._timestamp_candidates.get(fallback_key, []):
-                if int(record.get("option_type", -1)) != int(option_type):
-                    continue
-                if float(record.get("ask", 0.0)) <= 0:
-                    continue
-
-                expiry_ts = record.get("expiry_ts")
-                try:
-                    expiry_date = pd.Timestamp(expiry_ts).date()
-                except Exception:
-                    continue
-                dte = max((expiry_date - decision_date).days, 0)
-                if dte <= 0:
-                    continue
-
-                strike = float(record.get("strike", 0.0))
-                score = (
-                    age_ns / 3_600_000_000_000.0
-                    + abs(strike - target_strike) / max(abs(spot), 1.0)
-                    + abs(dte - target_dte) * 0.01
-                )
-                if score < best_score:
-                    best_score = score
-                    best = record
-
-            # Once we have inspected at least one prior trading-hours quote,
-            # prefer causality over an exact timestamp match and stop early
-            # when a close-enough strike/DTE candidate is found.
-            if best is not None and best_score < 0.20:
-                break
-            pos -= 1
-            steps += 1
-            if steps >= 500:
-                break
-
-        return best
+        result = fallback_map.get((int(option_type), int(strike_idx), int(dte_idx)))
+        self._candidate_lookup_cache[cache_key] = result
+        return result
 
     def _position_bid_ask(self, t: int) -> tuple[float, float]:
         if self.position is None or self.position.symbol is None:
             return 0.0, 0.0
-        timestamps = pd.DatetimeIndex(self.data["timestamp"])
-        start = min(max(int(t), 0), len(timestamps) - 1)
+        start = min(max(int(t), 0), len(self._data_timestamp_keys) - 1)
         for idx in range(start, max(start - 40, -1), -1):
-            key = self._timestamp_key(timestamps[idx])
+            key = self._data_timestamp_keys[idx]
             quote = self._symbol_quotes.get((key, self.position.symbol))
             if quote is not None:
                 return quote
