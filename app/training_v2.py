@@ -780,10 +780,9 @@ def select_best_checkpoint(
         ),
         key=lambda p: int(p.stem.rsplit("_", 2)[1]),
     )
-    latest = Path("models") / f"ppo_options_{ticker.lower()}{model_suffix}.zip"
+    # Only use checkpoints from this training configuration. Do not mix in
+    # the legacy top-level model, which was trained with the old episode/split.
     candidates = list(checkpoints)
-    if latest.exists():
-        candidates.append(latest)
     if not candidates:
         raise FileNotFoundError(
             "No checkpoints found. Train the model before selecting a checkpoint."
@@ -872,7 +871,7 @@ def train(ticker: str, timesteps: int = DEFAULT_TIMESTEPS, period: str = "730d",
     oos_split = len(data) - EPISODE_HOURS - 1
     pre_oos = data.iloc[:oos_split].reset_index(drop=True)
 
-    # Keep the final 145-day OOS block completely untouched. A shorter
+    # Keep the final 145-day OOS block completely untouched. A separate
     # pre-OOS validation block is reserved exclusively for checkpoint selection.
     validation_start = len(pre_oos) - VALIDATION_HOURS - 1
     fit_data = pre_oos.iloc[:validation_start].reset_index(drop=True)
