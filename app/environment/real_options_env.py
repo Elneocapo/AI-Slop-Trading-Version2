@@ -149,52 +149,60 @@ class RealOptionsTradingEnv(OptionsTradingEnv):
         self.real_option_mode = True
 
     def reset(self, *, seed=None, options=None):
-        """Reset on a causally covered bar without scanning option candidates."""
+        """Reset at the requested episode start and only require coverage somewhere in the episode."""
         super().reset(seed=seed)
         if not self.real_option_mode:
             return self._observation(), {}
 
         initial_t = int(self.t)
-        max_t = min(
-            len(self.data) - self.episode_hours - 1,
-            initial_t + 10 * 24 * 7,
-        )
+        max_t = len(self.data) - self.episode_hours - 1
+        if initial_t < self.lookback or initial_t > max_t:
+            raise ValueError(
+                "Real options reset start does not leave enough hourly data for the episode."
+            )
         if not self._all_quote_times:
             raise ValueError("Real options panel contains no usable quote timestamps.")
 
+        # The first episode bar does not need a quote itself. What matters is
+        # that the episode contains at least one causally available quote so the
+        # agent can trade once market coverage begins. This keeps fixed OOS /
+        # validation starts deterministic and never introduces future data.
+        search_end = min(initial_t + self.episode_hours - 1, len(self.data) - 1)
         quote_pos = bisect_right(
             self._all_quote_times,
-            self._data_timestamp_keys[initial_t - 1],
+            self._data_timestamp_keys[max(initial_t - 1, 0)],
         ) - 1
         if quote_pos < 0:
             quote_pos = 0
 
-        selected_t = None
+        covered = False
         pos = initial_t
-        while pos <= max_t:
-            decision_key = self._data_timestamp_keys[pos - 1]
+        while pos <= search_end:
+            decision_key = self._data_timestamp_keys[max(pos - 1, 0)]
             while (
                 quote_pos + 1 < len(self._all_quote_times)
                 and self._all_quote_times[quote_pos + 1] <= decision_key
             ):
                 quote_pos += 1
-            quote_key = self._all_quote_times[quote_pos]
-            age_ns = decision_key - quote_key
-            if (
-                self.is_regular_session(pos - 1)
-                and 0 <= age_ns <= 60 * 60 * 1_000_000_000
-            ):
-                selected_t = pos
-                break
+
+            if quote_pos >= 0:
+                quote_key = self._all_quote_times[quote_pos]
+                age_ns = decision_key - quote_key
+                if (
+                    self.is_regular_session(max(pos - 1, 0))
+                    and 0 <= age_ns <= 60 * 60 * 1_000_000_000
+                ):
+                    covered = True
+                    break
             pos += 1
 
-        if selected_t is None:
+        if not covered:
             raise ValueError(
-                "Real options panel has no causally available entry quote inside "
-                "the current episode window."
+                "Real options panel has no causally available entry quote anywhere "
+                "inside the current episode window."
             )
 
-        self.t = int(selected_t)
+        self.t = initial_t
         self.end_t = self.t + self.episode_hours
         self._candidate_observation_cache.clear()
         self._candidate_lookup_cache.clear()
