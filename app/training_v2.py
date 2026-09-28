@@ -17,9 +17,11 @@ from stable_baselines3.common.monitor import Monitor
 from app.environment.options_env import CALL, CONTRACT_SIZES, DTE_DAYS, STRIKE_OFFSETS, OptionsTradingEnv
 from app.environment.real_options_env import RealOptionsTradingEnv
 
-EPISODE_HOURS = 145 * 7
-VALIDATION_HOURS = 45 * 7  # Pre-OOS validation block used only for checkpoint selection.
+EPISODE_HOURS = 145 * 7  # Final untouched OOS horizon.
+TRAIN_EPISODE_HOURS = 45 * 7  # Random training episodes.
+VALIDATION_HOURS = 90 * 7  # Pre-OOS validation block used only for checkpoint selection.
 LOOKBACK = 60
+CHECKPOINT_DIR = Path("models") / "checkpoints" / "generalized_v2"
 DEFAULT_TIMESTEPS = 5_000_000
 MAX_TRADE_RISK_PCT = 0.05
 MAX_ROUNDTRIP_COST_PCT = 0.12  # Avoid contracts where fees/slippage dominate the premium.
@@ -757,7 +759,7 @@ def select_best_checkpoint(
     if data_source == "real":
         data = align_real_data_to_option_panel(data, option_panel)
 
-    minimum_required = EPISODE_HOURS + LOOKBACK + VALIDATION_HOURS + LOOKBACK + 2
+    minimum_required = TRAIN_EPISODE_HOURS + LOOKBACK + VALIDATION_HOURS + LOOKBACK + 2
     if len(data) <= minimum_required:
         raise ValueError(
             f"Not enough hourly history. Need more than {minimum_required} candles "
@@ -770,8 +772,11 @@ def select_best_checkpoint(
     validation_data = pre_oos.iloc[validation_start - LOOKBACK:].reset_index(drop=True)
 
     checkpoints = sorted(
-        Path("models/checkpoints").glob(
-            f"ppo_options_{ticker.lower()}{model_suffix}_*_steps.zip"
+        (
+            p for p in CHECKPOINT_DIR.glob(
+                f"ppo_options_{ticker.lower()}{model_suffix}_*_steps.zip"
+            )
+            if int(p.stem.rsplit("_", 2)[1]) % 50_000 == 0
         ),
         key=lambda p: int(p.stem.rsplit("_", 2)[1]),
     )
@@ -790,7 +795,7 @@ def select_best_checkpoint(
 
     print(
         f"Selecting among {len(candidates)} saved checkpoints using only the "
-        f"{VALIDATION_HOURS}-hour pre-OOS validation block."
+        f"{VALIDATION_HOURS}-hour pre-OOS validation block and 50k-step checkpoints."
     )
 
     for checkpoint_path in candidates:
@@ -858,7 +863,7 @@ def train(ticker: str, timesteps: int = DEFAULT_TIMESTEPS, period: str = "730d",
     model_suffix = "_real" if data_source == "real" else "_alpaca" if data_source == "alpaca" else ""
     if data_source == "real":
         data = align_real_data_to_option_panel(data, option_panel)
-    minimum_required = EPISODE_HOURS + LOOKBACK + VALIDATION_HOURS + LOOKBACK + 2
+    minimum_required = TRAIN_EPISODE_HOURS + LOOKBACK + VALIDATION_HOURS + LOOKBACK + 2
     if len(data) <= minimum_required:
         raise ValueError(
             f"Not enough hourly history. Need more than {minimum_required} candles "
@@ -876,15 +881,15 @@ def train(ticker: str, timesteps: int = DEFAULT_TIMESTEPS, period: str = "730d",
     ].reset_index(drop=True)
     test_data = data.iloc[oos_split - LOOKBACK:].reset_index(drop=True)
 
-    if len(fit_data) <= EPISODE_HOURS + LOOKBACK:
+    if len(fit_data) <= TRAIN_EPISODE_HOURS + LOOKBACK:
         raise ValueError(
-            "Not enough pre-OOS data left for a full 145-day training episode "
+            "Not enough pre-OOS data left for a full training episode "
             "after reserving the validation block."
         )
 
     train_env = Monitor(
         RiskManagedPPOEnv(
-            make_env(fit_data, option_panel=option_panel, episode_hours=EPISODE_HOURS)
+            make_env(fit_data, option_panel=option_panel, episode_hours=TRAIN_EPISODE_HOURS)
         )
     )
     eval_env = Monitor(
@@ -904,9 +909,10 @@ def train(ticker: str, timesteps: int = DEFAULT_TIMESTEPS, period: str = "730d",
     best = out / "best" / (model_suffix.strip("_") or "synthetic")
     best.mkdir(parents=True, exist_ok=True)
     path = out / f"ppo_options_{ticker.lower()}{model_suffix}"
+    CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
     checkpoint = CheckpointCallback(
         save_freq=10_000,
-        save_path=str(out / "checkpoints"),
+        save_path=str(CHECKPOINT_DIR),
         name_prefix=f"ppo_options_{ticker.lower()}{model_suffix}",
     )
     eval_callback = MaskableEvalCallback(
@@ -921,9 +927,9 @@ def train(ticker: str, timesteps: int = DEFAULT_TIMESTEPS, period: str = "730d",
     callback = CallbackList([checkpoint, eval_callback])
 
     if resume:
-        checkpoint_path = out / "checkpoints" / f"ppo_options_{ticker.lower()}_{timesteps}_steps.zip"
+        checkpoint_path = CHECKPOINT_DIR / f"ppo_options_{ticker.lower()}{model_suffix}_{timesteps}_steps.zip"
         candidates = sorted(
-            (out / "checkpoints").glob(f"ppo_options_{ticker.lower()}{model_suffix}_*_steps.zip"),
+            CHECKPOINT_DIR.glob(f"ppo_options_{ticker.lower()}{model_suffix}_*_steps.zip"),
             key=lambda p: int(p.stem.rsplit("_", 2)[1]),
         )
         if candidates:
