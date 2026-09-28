@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import shutil
 from pathlib import Path
 
 import gymnasium as gym
@@ -643,6 +644,214 @@ def evaluate_oos_segments(model, oos_data: pd.DataFrame, option_panel: pd.DataFr
     return results
 
 
+
+def evaluate_validation_segments(
+    model,
+    validation_data: pd.DataFrame,
+    option_panel: pd.DataFrame | None = None,
+    segments: int = 3,
+) -> dict:
+    """Evaluate a checkpoint on contiguous pre-OOS validation slices.
+
+    The final OOS block is never touched here. Each slice starts from €500 so
+    the checkpoint is rewarded for consistency rather than one lucky sequence
+    of compounding trades.
+    """
+    available_steps = len(validation_data) - LOOKBACK - 1
+    segment_steps = available_steps // segments
+    results = []
+
+    for segment_id in range(segments):
+        start = LOOKBACK + segment_id * segment_steps
+        if segment_id == segments - 1:
+            steps = available_steps - segment_id * segment_steps
+        else:
+            steps = segment_steps
+        if steps < 50:
+            continue
+
+        window = validation_data.iloc[
+            start - LOOKBACK : start + steps + 1
+        ].reset_index(drop=True)
+        env = RiskManagedPPOEnv(
+            make_env(
+                window,
+                option_panel=option_panel,
+                episode_hours=steps,
+                fixed_start=LOOKBACK,
+            )
+        )
+        obs, _ = env.reset(seed=500 + segment_id)
+        terminated = False
+        truncated = False
+        curve = [500.0]
+
+        while not (terminated or truncated):
+            masks = get_action_masks(env)
+            action, _ = model.predict(
+                obs,
+                deterministic=True,
+                action_masks=masks,
+            )
+            action = int(np.asarray(action).item())
+            obs, _, terminated, truncated, _ = env.step(action)
+            curve.append(float(env.equity))
+
+        running_peak = np.maximum.accumulate(curve)
+        drawdowns = (np.asarray(curve) - running_peak) / np.maximum(
+            running_peak, 1e-9
+        )
+        pnls = [float(t["pnl"]) for t in env.trade_log]
+        results.append(
+            {
+                "segment": segment_id + 1,
+                "return_pct": float((env.equity / 500.0 - 1.0) * 100.0),
+                "max_drawdown_pct": float(-drawdowns.min() * 100.0),
+                "trades": len(pnls),
+                "win_rate_pct": (
+                    sum(p > 0 for p in pnls) / len(pnls) * 100.0
+                    if pnls
+                    else 0.0
+                ),
+            }
+        )
+
+    if not results:
+        raise ValueError("Validation window is too short for checkpoint selection.")
+
+    returns = np.asarray([r["return_pct"] for r in results], dtype=float)
+    drawdowns = np.asarray(
+        [r["max_drawdown_pct"] for r in results], dtype=float
+    )
+    # Primary criterion: the median return across the validation slices.
+    # Tie-breaks favour lower median drawdown and then higher mean return.
+    median_return = float(np.median(returns))
+    median_drawdown = float(np.median(drawdowns))
+    mean_return = float(np.mean(returns))
+    score = median_return - 0.25 * median_drawdown
+    return {
+        "score": score,
+        "median_return_pct": median_return,
+        "median_drawdown_pct": median_drawdown,
+        "mean_return_pct": mean_return,
+        "segments": results,
+    }
+
+
+def select_best_checkpoint(
+    ticker: str,
+    period: str = "730d",
+    data_source: str = "real",
+    options_file: str = "data/nvda_real_options.csv.gz",
+) -> Path:
+    """Select the financially strongest robust checkpoint using pre-OOS validation only."""
+    data = load_hourly_data(ticker, period)
+    option_panel = (
+        load_option_panel(Path(options_file))
+        if data_source in {"real", "alpaca"}
+        else None
+    )
+    model_suffix = (
+        "_real" if data_source == "real" else "_alpaca" if data_source == "alpaca" else ""
+    )
+    if data_source == "real":
+        data = align_real_data_to_option_panel(data, option_panel)
+
+    minimum_required = EPISODE_HOURS + LOOKBACK + VALIDATION_HOURS + LOOKBACK + 2
+    if len(data) <= minimum_required:
+        raise ValueError(
+            f"Not enough hourly history. Need more than {minimum_required} candles "
+            "for training + validation + untouched OOS."
+        )
+
+    oos_split = len(data) - EPISODE_HOURS - 1
+    pre_oos = data.iloc[:oos_split].reset_index(drop=True)
+    validation_start = len(pre_oos) - VALIDATION_HOURS - 1
+    validation_data = pre_oos.iloc[validation_start - LOOKBACK:].reset_index(drop=True)
+
+    checkpoints = sorted(
+        Path("models/checkpoints").glob(
+            f"ppo_options_{ticker.lower()}{model_suffix}_*_steps.zip"
+        ),
+        key=lambda p: int(p.stem.rsplit("_", 2)[1]),
+    )
+    latest = Path("models") / f"ppo_options_{ticker.lower()}{model_suffix}.zip"
+    candidates = list(checkpoints)
+    if latest.exists():
+        candidates.append(latest)
+    if not candidates:
+        raise FileNotFoundError(
+            "No checkpoints found. Train the model before selecting a checkpoint."
+        )
+
+    rows = []
+    best_path = None
+    best_key = None
+
+    print(
+        f"Selecting among {len(candidates)} saved checkpoints using only the "
+        f"{VALIDATION_HOURS}-hour pre-OOS validation block."
+    )
+
+    for checkpoint_path in candidates:
+        model = MaskablePPO.load(checkpoint_path, device="auto")
+        summary = evaluate_validation_segments(
+            model,
+            validation_data,
+            option_panel=option_panel,
+            segments=3,
+        )
+        key = (
+            float(summary["score"]),
+            -float(summary["median_drawdown_pct"]),
+            float(summary["mean_return_pct"]),
+        )
+        rows.append(
+            {
+                "checkpoint": str(checkpoint_path),
+                "score": float(summary["score"]),
+                "median_return_pct": float(summary["median_return_pct"]),
+                "median_drawdown_pct": float(summary["median_drawdown_pct"]),
+                "mean_return_pct": float(summary["mean_return_pct"]),
+                "segment_1_return_pct": summary["segments"][0]["return_pct"]
+                if len(summary["segments"]) > 0 else np.nan,
+                "segment_2_return_pct": summary["segments"][1]["return_pct"]
+                if len(summary["segments"]) > 1 else np.nan,
+                "segment_3_return_pct": summary["segments"][2]["return_pct"]
+                if len(summary["segments"]) > 2 else np.nan,
+            }
+        )
+        if best_key is None or key > best_key:
+            best_key = key
+            best_path = checkpoint_path
+
+    if best_path is None:
+        raise RuntimeError("Checkpoint selection produced no candidate.")
+
+    best_dir = Path("models/best") / (model_suffix.strip("_") or "synthetic")
+    best_dir.mkdir(parents=True, exist_ok=True)
+    best_model_path = best_dir / "best_model.zip"
+    shutil.copy2(best_path, best_model_path)
+
+    audit_dir = Path("training_eval") / "validation_selection"
+    audit_dir.mkdir(parents=True, exist_ok=True)
+    audit = pd.DataFrame(rows).sort_values(
+        ["score", "median_return_pct", "mean_return_pct"],
+        ascending=False,
+    )
+    audit.to_csv(audit_dir / "checkpoint_selection.csv", index=False)
+
+    chosen = audit.iloc[0]
+    print(f"Selected checkpoint: {best_path}")
+    print(
+        f"Validation median return: {float(chosen['median_return_pct']):.2f}% | "
+        f"median max DD: {float(chosen['median_drawdown_pct']):.2f}% | "
+        f"selection score: {float(chosen['score']):.2f}"
+    )
+    print(f"Copied to: {best_model_path}")
+    print(f"Selection audit: {audit_dir / 'checkpoint_selection.csv'}")
+    return best_model_path
+
 def train(ticker: str, timesteps: int = DEFAULT_TIMESTEPS, period: str = "730d", resume: bool = False, data_source: str = "real", options_file: str = "data/nvda_real_options.csv.gz") -> Path:
     data = load_hourly_data(ticker, period)
     option_panel = load_option_panel(Path(options_file)) if data_source in {"real", "alpaca"} else None
@@ -747,13 +956,15 @@ def train(ticker: str, timesteps: int = DEFAULT_TIMESTEPS, period: str = "730d",
     model.learn(total_timesteps=timesteps, callback=callback, reset_num_timesteps=not resume, progress_bar=True)
     model.save(path)
 
-    # The final OOS must be evaluated with the checkpoint selected on the
-    # separate pre-OOS validation block, not with the last training weights.
-    best_model_path = best / "best_model.zip"
-    eval_model = model
-    if best_model_path.exists():
-        print(f"Evaluating validation-selected checkpoint: {best_model_path}")
-        eval_model = MaskablePPO.load(best_model_path, device="auto")
+    # Select the financially strongest robust checkpoint using the separate
+    # pre-OOS validation block before touching the final OOS holdout.
+    best_model_path = select_best_checkpoint(
+        ticker,
+        period=period,
+        data_source=data_source,
+        options_file=options_file,
+    )
+    eval_model = MaskablePPO.load(best_model_path, device="auto")
 
     report_dir = Path("training_eval") / "latest_oos"
     r = evaluate(eval_model, test_data, report_dir=report_dir, option_panel=option_panel)
@@ -811,11 +1022,19 @@ def main():
     p.add_argument("--period", default="730d")
     p.add_argument("--resume", action="store_true")
     p.add_argument("--eval-only", action="store_true", help="Evaluate the saved model without training.")
+    p.add_argument("--select-best", action="store_true", help="Select the best saved checkpoint using pre-OOS validation only.")
     p.add_argument("--data-source", choices=["synthetic", "alpaca", "real"], default="real", help="Options data source (default: real OPRA panel).")
     p.add_argument("--options-file", default="data/nvda_real_options.csv.gz", help="Real/alpaca options panel path.")
     a = p.parse_args()
     ticker = a.ticker.upper()
-    if a.eval_only:
+    if a.select_best:
+        select_best_checkpoint(
+            ticker,
+            period=a.period,
+            data_source=a.data_source,
+            options_file=a.options_file,
+        )
+    elif a.eval_only:
         data = load_hourly_data(ticker, a.period)
         option_panel = load_option_panel(Path(a.options_file)) if a.data_source in {"real", "alpaca"} else None
         if a.data_source == "real":
