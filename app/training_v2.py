@@ -747,8 +747,16 @@ def train(ticker: str, timesteps: int = DEFAULT_TIMESTEPS, period: str = "730d",
     model.learn(total_timesteps=timesteps, callback=callback, reset_num_timesteps=not resume, progress_bar=True)
     model.save(path)
 
+    # The final OOS must be evaluated with the checkpoint selected on the
+    # separate pre-OOS validation block, not with the last training weights.
+    best_model_path = best / "best_model.zip"
+    eval_model = model
+    if best_model_path.exists():
+        print(f"Evaluating validation-selected checkpoint: {best_model_path}")
+        eval_model = MaskablePPO.load(best_model_path, device="auto")
+
     report_dir = Path("training_eval") / "latest_oos"
-    r = evaluate(model, test_data, report_dir=report_dir, option_panel=option_panel)
+    r = evaluate(eval_model, test_data, report_dir=report_dir, option_panel=option_panel)
 
     print(f"Validation block for checkpoint selection: {VALIDATION_HOURS} hourly steps (~45 trading days); final OOS remains untouched.")
     print("\n=== 145-DAY OUT-OF-SAMPLE TEST ===")
@@ -815,10 +823,13 @@ def main():
         split = len(data) - EPISODE_HOURS - 1
         test_data = data.iloc[split - LOOKBACK:].reset_index(drop=True)
         model_suffix = "_real" if a.data_source == "real" else "_alpaca" if a.data_source == "alpaca" else ""
-        model_path = Path("models") / f"ppo_options_{ticker.lower()}{model_suffix}.zip"
+        latest_model_path = Path("models") / f"ppo_options_{ticker.lower()}{model_suffix}.zip"
+        best_model_path = Path("models") / "best" / (model_suffix.strip("_") or "synthetic") / "best_model.zip"
+        model_path = best_model_path if best_model_path.exists() else latest_model_path
         if not model_path.exists():
             raise FileNotFoundError(f"Saved model not found: {model_path}")
         model = MaskablePPO.load(model_path, device="auto")
+        print(f"Evaluating saved model: {model_path}")
         r = evaluate(
             model,
             test_data,
