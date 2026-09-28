@@ -18,13 +18,13 @@ from app.environment.options_env import CALL, CONTRACT_SIZES, DTE_DAYS, STRIKE_O
 from app.environment.real_options_env import RealOptionsTradingEnv
 
 EPISODE_HOURS = 145 * 7  # Final untouched OOS horizon.
-TRAIN_EPISODE_HOURS = 45 * 7  # Random training episodes.
-VALIDATION_HOURS = 90 * 7  # Pre-OOS validation block used only for checkpoint selection.
+TRAIN_EPISODE_HOURS = 30 * 7  # Short random training episodes increase temporal variety.
+VALIDATION_HOURS = 45 * 7  # Pre-OOS validation block used only for checkpoint selection.
 LOOKBACK = 60
 CHECKPOINT_DIR = Path("models") / "checkpoints" / "generalized_v2"
 DEFAULT_TIMESTEPS = 5_000_000
 MAX_TRADE_RISK_PCT = 0.05
-MAX_ROUNDTRIP_COST_PCT = 0.12  # Avoid contracts where fees/slippage dominate the premium.
+MAX_ROUNDTRIP_COST_PCT = 0.08  # Keep round-trip costs below 8% of premium notional.
 INVALID_ACTION_PENALTY = 0.01
 NO_POSITION_CLOSE_PENALTY = 0.002
 DRAWDOWN_REWARD_PENALTY = 0.05
@@ -37,7 +37,8 @@ OTM_PENALTY_RATE = 0.10
 MAX_OTM_PENALTY = 0.02
 TRADE_REWARD_WEIGHT = 1.0  # Realized trade outcome is the primary PPO signal.
 POSITION_MARK_REWARD_WEIGHT = 0.15  # Small dense signal only while a position is open.
-EXPIRY_REWARD_PENALTY = 0.03
+ENTRY_REWARD_PENALTY = 0.015  # Mild anti-churn signal applied once per new position.
+MIN_HOLDING_STEPS = 3  # Prevent immediate churn; roughly 3 hourly bars.
 MIN_ENTRY_DTE_INDEX = 1  # Skip 1-DTE entries during policy learning.
 FORCED_EXIT_BEFORE_EXPIRY_STEPS = 7  # Never carry a long option into the final trading day.
 REAL_TRANSACTION_COST = 0.25  # Keep a €500 account tradable without removing the 5% risk cap.
@@ -196,7 +197,10 @@ class RiskManagedPPOEnv(gym.Wrapper):
                 mask[:] = False
                 mask[1] = True
             else:
-                mask[1] = True  # CLOSE is valid while a position is open.
+                held_steps = max(int(self.env.t) - int(self.env.position.entry_t), 0)
+                if held_steps >= MIN_HOLDING_STEPS:
+                    mask[1] = True  # CLOSE is valid after the minimum hold.
+
         elif getattr(self.env, "real_option_mode", False):
             decision_t = max(self.env.t - 1, 0)
             if self.env.is_regular_session(decision_t):
@@ -330,6 +334,7 @@ class RiskManagedPPOEnv(gym.Wrapper):
         trades_before = len(self.env.trade_log)
         had_position = self.env.position is not None
         obs, base_reward, terminated, truncated, info = self.env.step(translated)
+        opened_position = (not had_position) and (self.env.position is not None)
 
         # Primary signal: realized P&L on completed trades.
         reward = 0.0
@@ -378,6 +383,9 @@ class RiskManagedPPOEnv(gym.Wrapper):
             # Small causal mark-to-market signal only while holding the chosen
             # contract; realized P&L remains the dominant learning target.
             reward = POSITION_MARK_REWARD_WEIGHT * float(base_reward)
+
+        if opened_position:
+            reward -= ENTRY_REWARD_PENALTY
 
         if self.last_rejected:
             reward -= INVALID_ACTION_PENALTY
