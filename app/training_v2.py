@@ -480,9 +480,9 @@ def load_hourly_data(ticker: str, period: str = "730d") -> pd.DataFrame:
     return df.dropna().reset_index(drop=True)
 
 
-def evaluate(model, data: pd.DataFrame, report_dir: Path | None = None, option_panel: pd.DataFrame | None = None, max_drawdown_limit: float = MAX_DRAWDOWN_LIMIT) -> dict:
+def evaluate(model, data: pd.DataFrame, report_dir: Path | None = None, option_panel: pd.DataFrame | None = None, max_drawdown_limit: float = MAX_DRAWDOWN_LIMIT, episode_hours: int = EPISODE_HOURS) -> dict:
     env = RiskManagedPPOEnv(
-        make_env(data, option_panel=option_panel, fixed_start=LOOKBACK, episode_hours=EPISODE_HOURS, max_drawdown_limit=max_drawdown_limit)
+        make_env(data, option_panel=option_panel, fixed_start=LOOKBACK, episode_hours=episode_hours, max_drawdown_limit=max_drawdown_limit)
     )
     obs, _ = env.reset(seed=123)
     terminated = False
@@ -1110,6 +1110,7 @@ def main():
                 report_dir=sweep_dir,
                 option_panel=option_panel,
                 max_drawdown_limit=limit,
+                episode_hours=VALIDATION_HOURS,
             )
             print(
                 f"VALIDATION DD LIMIT {limit:.0%} | return {r['return_pct']:.2f}% | "
