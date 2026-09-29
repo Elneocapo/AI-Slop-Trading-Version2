@@ -49,7 +49,7 @@ ENTRY_REWARD_PENALTY = 0.012  # Mild anti-churn signal applied once per new posi
 MIN_HOLDING_STEPS = 3  # Prevent immediate churn; roughly 3 hourly bars.
 MIN_ENTRY_DTE_INDEX = 1  # Skip 1-DTE entries during policy learning.
 FORCED_EXIT_BEFORE_EXPIRY_STEPS = 7  # Never carry a long option into the final trading day.
-REAL_TRANSACTION_COST = 0.25  # Keep a €500 account tradable without removing the 5% risk cap.
+REAL_TRANSACTION_COST = 0.25  # Round-trip fee is €0.50 per one-contract position.
 MAX_DRAWDOWN_LIMIT = 0.25
 MIN_VALIDATION_TRADES = 4
 MIN_ACTIVE_VALIDATION_SEGMENTS = 2
@@ -1294,7 +1294,13 @@ def main():
             data = align_real_data_to_option_panel(data, option_panel)
         split = len(data) - EPISODE_HOURS - 1
         test_data = data.iloc[split - LOOKBACK:].reset_index(drop=True)
-        model_suffix = "_real" if a.data_source == "real" else "_alpaca" if a.data_source == "alpaca" else ""
+        model_suffix = (
+            "_real" + MODEL_TAG
+            if a.data_source == "real"
+            else "_alpaca" + MODEL_TAG
+            if a.data_source == "alpaca"
+            else MODEL_TAG
+        )
         best_model_path = Path("models") / "best" / (model_suffix.strip("_") or "synthetic") / "best_model.zip"
         latest_model_path = Path("models") / f"ppo_options_{ticker.lower()}{model_suffix}.zip"
         model_path = best_model_path if best_model_path.exists() else latest_model_path
@@ -1324,7 +1330,13 @@ def main():
             data = align_real_data_to_option_panel(data, option_panel)
         split = len(data) - EPISODE_HOURS - 1
         test_data = data.iloc[split - LOOKBACK:].reset_index(drop=True)
-        model_suffix = "_real" if a.data_source == "real" else "_alpaca" if a.data_source == "alpaca" else ""
+        model_suffix = (
+            "_real" + MODEL_TAG
+            if a.data_source == "real"
+            else "_alpaca" + MODEL_TAG
+            if a.data_source == "alpaca"
+            else MODEL_TAG
+        )
         latest_model_path = Path("models") / f"ppo_options_{ticker.lower()}{model_suffix}.zip"
         best_model_path = Path("models") / "best" / (model_suffix.strip("_") or "synthetic") / "best_model.zip"
         model_path = best_model_path if best_model_path.exists() else latest_model_path
@@ -1342,7 +1354,7 @@ def main():
         )
         print("\n=== 145-DAY OUT-OF-SAMPLE EVALUATION (SAVED MODEL) ===")
         print(f"Ticker: {ticker}")
-        print("Initial capital: €{INITIAL_CASH:.2f}")
+        print(f"Initial capital: €{INITIAL_CASH:.2f}")
         print(f"Final equity: €{r['final']:,.2f}")
         print(f"P&L: €{r['pnl']:,.2f}")
         print(f"Return: {r['return_pct']:.2f}%")
