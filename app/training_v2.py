@@ -18,18 +18,18 @@ from app.environment.options_env import CALL, CONTRACT_SIZES, DTE_DAYS, STRIKE_O
 from app.environment.real_options_env import RealOptionsTradingEnv
 
 EPISODE_HOURS = 145 * 7  # Final untouched OOS horizon.
-TRAIN_EPISODE_HOURS = 30 * 7  # Short random training episodes increase temporal variety.
-VALIDATION_HOURS = 45 * 7  # Pre-OOS validation block used only for checkpoint selection.
+TRAIN_EPISODE_HOURS = 20 * 7  # Short random training episodes increase temporal variety.
+VALIDATION_HOURS = 60 * 7  # Two-month pre-OOS validation block used only for checkpoint selection.
 LOOKBACK = 60
-CHECKPOINT_DIR = Path("models") / "checkpoints" / "generalized_v3"
-DEFAULT_TIMESTEPS = 5_000_000
+CHECKPOINT_DIR = Path("models") / "checkpoints" / "generalized_v4"
+DEFAULT_TIMESTEPS = 1_000_000
 MAX_TRADE_RISK_PCT = 0.05
 MAX_ROUNDTRIP_COST_PCT = 0.08  # Keep round-trip costs below 8% of premium notional.
 INVALID_ACTION_PENALTY = 0.01
 NO_POSITION_CLOSE_PENALTY = 0.002
 DRAWDOWN_REWARD_PENALTY = 0.05
 HOLDING_DECAY_PENALTY = 0.0015
-REWARD_PNL_SCALE = 50.0  # Compress rare outsized winners so one trade cannot dominate PPO.
+REWARD_PNL_SCALE = 30.0  # Give meaningful weight to large losses as well as outsized winners.
 LOSS_STREAK_PENALTY = 0.003  # Mild shaping only; dense equity reward remains primary.
 MAX_LOSS_STREAK_FOR_PENALTY = 2
 OTM_PENALTY_START = 0.05  # 5% OTM is tolerated before reward shaping begins.
@@ -37,7 +37,7 @@ OTM_PENALTY_RATE = 0.10
 MAX_OTM_PENALTY = 0.02
 TRADE_REWARD_WEIGHT = 1.0  # Realized trade outcome is the primary PPO signal.
 POSITION_MARK_REWARD_WEIGHT = 0.15  # Small dense signal only while a position is open.
-ENTRY_REWARD_PENALTY = 0.015  # Mild anti-churn signal applied once per new position.
+ENTRY_REWARD_PENALTY = 0.012  # Mild anti-churn signal applied once per new position.
 MIN_HOLDING_STEPS = 3  # Prevent immediate churn; roughly 3 hourly bars.
 MIN_ENTRY_DTE_INDEX = 1  # Skip 1-DTE entries during policy learning.
 FORCED_EXIT_BEFORE_EXPIRY_STEPS = 7  # Never carry a long option into the final trading day.
@@ -962,7 +962,7 @@ def train(ticker: str, timesteps: int = DEFAULT_TIMESTEPS, period: str = "730d",
     path = out / f"ppo_options_{ticker.lower()}{model_suffix}"
     CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
     checkpoint = CheckpointCallback(
-        save_freq=10_000,
+        save_freq=50_000,
         save_path=str(CHECKPOINT_DIR),
         name_prefix=f"ppo_options_{ticker.lower()}{model_suffix}",
     )
@@ -995,13 +995,13 @@ def train(ticker: str, timesteps: int = DEFAULT_TIMESTEPS, period: str = "730d",
         model = MaskablePPO(
         "MlpPolicy",
         train_env,
-        learning_rate=3e-4,
+        learning_rate=1e-4,
         n_steps=2048,
         batch_size=256,
         gamma=0.995,
         gae_lambda=0.95,
-        ent_coef=0.01,
-        clip_range=0.2,
+        ent_coef=0.005,
+        clip_range=0.15,
         verbose=1,
         seed=42,
         device="auto",
@@ -1026,7 +1026,7 @@ def train(ticker: str, timesteps: int = DEFAULT_TIMESTEPS, period: str = "730d",
     report_dir = Path("training_eval") / "latest_oos"
     r = evaluate(eval_model, test_data, report_dir=report_dir, option_panel=option_panel)
 
-    print(f"Validation block for checkpoint selection: {VALIDATION_HOURS} hourly steps (~45 trading days); final OOS remains untouched.")
+    print(f"Validation block for checkpoint selection: {VALIDATION_HOURS} hourly steps (~60 trading days); final OOS remains untouched.")
     print("\n=== 145-DAY OUT-OF-SAMPLE TEST ===")
     print(f"Ticker: {ticker}\nLookback: {LOOKBACK} hourly candles\nEpisode: {EPISODE_HOURS} hourly steps (~145 trading days)")
     print("Initial capital: €500.00")
