@@ -317,6 +317,94 @@ class RealOptionsTradingEnv(OptionsTradingEnv):
             return self.cash + bid * self.multiplier * self.position.contracts
         return self.cash + self.position.collateral - ask * self.multiplier * self.position.contracts
 
+    def _settle_expiry_causal(self, decision_t: int) -> bool:
+        """Settle an expired position using only the last observed bar."""
+        if self.position is None or int(self.position.expiry_t) > int(decision_t):
+            return False
+        position = self.position
+        spot = float(self.data.loc[int(decision_t), "Close"])
+        call = position.kind in (1, -1) if position.kind in (1, -1) else position.kind in (1, 2)
+        intrinsic = max(spot - position.strike, 0.0) if call else max(position.strike - spot, 0.0)
+        value = intrinsic * self.multiplier * position.contracts
+        if position.kind in (1, -1):
+            self.cash += value
+            pnl = (intrinsic - position.entry_price) * self.multiplier * position.contracts - self.transaction_cost
+        else:
+            self.cash += position.collateral - value
+            pnl = (position.entry_price - intrinsic) * self.multiplier * position.contracts - self.transaction_cost
+
+        self.trade_log.append({
+            "entry_t": position.entry_t,
+            "exit_t": int(decision_t),
+            "kind": position.kind,
+            "strike": position.strike,
+            "contracts": position.contracts,
+            "entry_price": position.entry_price,
+            "exit_price": intrinsic,
+            "pnl": pnl,
+            "reason": "expiry",
+            "transaction_costs": self.transaction_cost,
+            "symbol": position.symbol,
+            "entry_spot": float(getattr(position, "entry_spot", np.nan)),
+            "entry_moneyness": (
+                float(position.strike) / float(getattr(position, "entry_spot", np.nan)) - 1.0
+                if float(getattr(position, "entry_spot", np.nan)) > 0 else np.nan
+            ),
+        })
+        self.position = None
+        return True
+
+    def step(self, action):
+        """Advance one bar while keeping execution and reward fully causal."""
+        action = np.asarray(action, dtype=np.int64).reshape(-1)
+        if len(action) != 5:
+            raise ValueError(f"Expected 5 action values, got {len(action)}")
+        operation, option_type, strike_idx, dte_idx, size_idx = [int(x) for x in action]
+
+        decision_t = max(int(self.t) - 1, 0)
+        pre_action_equity = self._equity(decision_t)
+
+        if operation in (OPEN_LONG, OPEN_SHORT):
+            self._open(operation, option_type, strike_idx, dte_idx, size_idx)
+        elif operation == CLOSE:
+            self._close(mark_t=decision_t, reason="close")
+
+        self.t += 1
+        terminated = self.t >= self.end_t
+
+        # Expiry is evaluated at the last observed bar, never at the newly
+        # hidden t bar.
+        self._settle_expiry_causal(decision_t)
+
+        self.equity = self._equity(decision_t)
+        self.peak_equity = max(self.peak_equity, self.equity)
+        drawdown = max(
+            0.0,
+            (self.peak_equity - self.equity) / max(self.peak_equity, 1e-9),
+        )
+
+        risk_stop = drawdown >= self.max_drawdown_limit
+        if risk_stop and self.position is not None:
+            self._close(mark_t=decision_t, reason="risk_stop")
+            self.equity = self._equity(decision_t)
+            drawdown = max(
+                0.0,
+                (self.peak_equity - self.equity) / max(self.peak_equity, 1e-9),
+            )
+
+        reward = (self.equity - pre_action_equity) / self.initial_cash
+        reward -= drawdown * 0.02
+        self.previous_equity = self.equity
+        if risk_stop:
+            terminated = True
+
+        return self._observation(), float(reward), terminated, False, {
+            "equity": self.equity,
+            "drawdown": drawdown,
+            "trade_count": len(self.trade_log),
+            "risk_stop": risk_stop,
+        }
+
     def _close(self, mark_t: int | None = None, reason: str = "close"):
         if self.position is None:
             return
