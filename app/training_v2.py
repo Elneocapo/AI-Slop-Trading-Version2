@@ -22,15 +22,22 @@ EPISODE_HOURS = 145 * 7  # Final untouched OOS horizon.
 TRAIN_EPISODE_HOURS = 20 * 7  # Short random training episodes increase temporal variety.
 VALIDATION_HOURS = 60 * 7  # Two-month pre-OOS validation block used only for checkpoint selection.
 LOOKBACK = 60
-CHECKPOINT_DIR = Path("models") / "checkpoints" / "generalized_v4"
+
+# Small-account profile: one standard option contract should be affordable
+# without requiring an absurd fraction of capital. The previous €500/5% setup
+# allowed roughly €25 per new position; €70/35% preserves that same absolute
+# position budget while making trade P&L material on a small account.
+INITIAL_CASH = 70.0
+MAX_TRADE_RISK_PCT = 0.35
+REWARD_PNL_SCALE = INITIAL_CASH * 0.10  # Scale realized P&L to account size.
+MODEL_TAG = "_small70"
+CHECKPOINT_DIR = Path("models") / "checkpoints" / "small70_v1"
 DEFAULT_TIMESTEPS = 1_000_000
-MAX_TRADE_RISK_PCT = 0.05
 MAX_ROUNDTRIP_COST_PCT = 0.08  # Keep round-trip costs below 8% of premium notional.
 INVALID_ACTION_PENALTY = 0.01
 NO_POSITION_CLOSE_PENALTY = 0.002
 DRAWDOWN_REWARD_PENALTY = 0.05
 HOLDING_DECAY_PENALTY = 0.0015
-REWARD_PNL_SCALE = 30.0  # Give meaningful weight to large losses as well as outsized winners.
 LOSS_STREAK_PENALTY = 0.003  # Mild shaping only; dense equity reward remains primary.
 MAX_LOSS_STREAK_FOR_PENALTY = 2
 OTM_PENALTY_START = 0.05  # 5% OTM is tolerated before reward shaping begins.
@@ -51,7 +58,7 @@ MIN_ACTIVE_VALIDATION_SEGMENTS = 2
 def make_env(data, option_panel=None, fixed_start=None, episode_hours=EPISODE_HOURS, max_drawdown_limit=MAX_DRAWDOWN_LIMIT):
     env_cls = RealOptionsTradingEnv if option_panel is not None else OptionsTradingEnv
     kwargs = {
-        "initial_cash": 500.0,
+        "initial_cash": INITIAL_CASH,
         "lookback": LOOKBACK,
         "episode_hours": episode_hours,
         "fixed_start": fixed_start,
@@ -543,15 +550,15 @@ def evaluate(model, data: pd.DataFrame, report_dir: Path | None = None, option_p
             "worst_trade": float(min(trade_pnls, default=0.0)),
             "sum_trade_pnl": float(sum(trade_pnls)),
             "transaction_costs": float(env.env.total_transaction_costs),
-            "equity_minus_500": float(env.equity - 500.0),
-            "pnl_reconciliation_difference": float(sum(trade_pnls) - (env.equity - 500.0)),
+            "equity_minus_initial_cash": float(env.equity - env.initial_cash),
+            "pnl_reconciliation_difference": float(sum(trade_pnls) - (env.equity - env.initial_cash)),
             **{f"invalid_{k}": v for k, v in invalid_reasons.items()},
         }]).to_csv(report_dir / "oos_action_audit.csv", index=False)
 
     return {
         "final": float(env.equity),
-        "pnl": float(env.equity - 500.0),
-        "return_pct": float((env.equity / 500.0 - 1) * 100),
+        "pnl": float(env.equity - env.initial_cash),
+        "return_pct": float((env.equity / env.initial_cash - 1) * 100),
         "max_drawdown_pct": float(-info["drawdown"] * 100),
         "trades": trades,
         "actions": actions,
@@ -598,7 +605,11 @@ def compare_checkpoints(
     split = len(data) - EPISODE_HOURS - 1
     test_data = data.iloc[split - LOOKBACK:].reset_index(drop=True)
     model_suffix = (
-        "_real" if data_source == "real" else "_alpaca" if data_source == "alpaca" else ""
+        "_real" + MODEL_TAG
+        if data_source == "real"
+        else "_alpaca" + MODEL_TAG
+        if data_source == "alpaca"
+        else MODEL_TAG
     )
     paths = [
         CHECKPOINT_DIR / f"ppo_options_{ticker.lower()}{model_suffix}_{steps_a}_steps.zip",
@@ -646,7 +657,7 @@ def compare_checkpoints(
         actions_by_model.append(actions)
         summaries.append(
             {
-                "return_pct": float((env.equity / 500.0 - 1.0) * 100.0),
+                "return_pct": float((env.equity / env.initial_cash - 1.0) * 100.0),
                 "max_drawdown_pct": float(
                     -max(
                         (
@@ -691,7 +702,7 @@ def evaluate_baselines(oos_data: pd.DataFrame) -> dict:
 
     # Cash benchmark is the reference for an options account with no trades.
     return {
-        "cash_final": 500.0,
+        "cash_final": INITIAL_CASH,
         "cash_return_pct": 0.0,
         "underlying_buy_hold_return_pct": float(buy_hold),
     }
@@ -729,7 +740,7 @@ def evaluate_oos_segments(model, oos_data: pd.DataFrame, option_panel: pd.DataFr
         )
         obs, _ = env.reset(seed=200 + segment_id)
         terminated = False
-        curve = [500.0]
+        curve = [INITIAL_CASH]
         actions = []
         while not terminated:
             masks = get_action_masks(env)
@@ -774,7 +785,7 @@ def evaluate_validation_segments(
 ) -> dict:
     """Evaluate a checkpoint on contiguous pre-OOS validation slices.
 
-    The final OOS block is never touched here. Each slice starts from €500 so
+    The final OOS block is never touched here. Each slice starts from the configured small-account capital so
     the checkpoint is rewarded for consistency rather than one lucky sequence
     of compounding trades.
     """
@@ -806,7 +817,7 @@ def evaluate_validation_segments(
         obs, _ = env.reset(seed=500 + segment_id)
         terminated = False
         truncated = False
-        curve = [500.0]
+        curve = [INITIAL_CASH]
 
         while not (terminated or truncated):
             masks = get_action_masks(env)
@@ -1048,7 +1059,13 @@ def select_best_checkpoint(
 def train(ticker: str, timesteps: int = DEFAULT_TIMESTEPS, period: str = "730d", resume: bool = False, data_source: str = "real", options_file: str = "data/nvda_real_options.csv.gz") -> Path:
     data = load_hourly_data(ticker, period)
     option_panel = load_option_panel(Path(options_file)) if data_source in {"real", "alpaca"} else None
-    model_suffix = "_real" if data_source == "real" else "_alpaca" if data_source == "alpaca" else ""
+    model_suffix = (
+        "_real" + MODEL_TAG
+        if data_source == "real"
+        else "_alpaca" + MODEL_TAG
+        if data_source == "alpaca"
+        else MODEL_TAG
+    )
     if data_source == "real":
         data = align_real_data_to_option_panel(data, option_panel)
     minimum_required = TRAIN_EPISODE_HOURS + LOOKBACK + VALIDATION_HOURS + LOOKBACK + 2
@@ -1166,7 +1183,7 @@ def train(ticker: str, timesteps: int = DEFAULT_TIMESTEPS, period: str = "730d",
     print(f"Validation block for checkpoint selection: {VALIDATION_HOURS} hourly steps (~60 trading days); final OOS remains untouched.")
     print("\n=== 145-DAY OUT-OF-SAMPLE TEST ===")
     print(f"Ticker: {ticker}\nLookback: {LOOKBACK} hourly candles\nEpisode: {EPISODE_HOURS} hourly steps (~145 trading days)")
-    print("Initial capital: €500.00")
+    print(f"Initial capital: €{INITIAL_CASH:.2f}")
     print(f"Final equity: €{r['final']:,.2f}\nP&L: €{r['pnl']:,.2f}\nReturn: {r['return_pct']:.2f}%\nMax drawdown: {r['max_drawdown_pct']:.2f}%")
     print(f"Closed trades: {r['trade_count']}\nWin rate: {r['win_rate_pct']:.2f}% ({r['win_count']}W / {r['loss_count']}L)")
     print(f"Long trades: {r['long_count']} | Short trades: {r['short_count']}\nCalls: {r['call_count']} | Puts: {r['put_count']}")
@@ -1241,7 +1258,13 @@ def main():
             data_source=a.data_source,
             options_file=a.options_file,
         )
-        model_suffix = "_real" if a.data_source == "real" else "_alpaca" if a.data_source == "alpaca" else ""
+        model_suffix = (
+            "_real" + MODEL_TAG
+            if a.data_source == "real"
+            else "_alpaca" + MODEL_TAG
+            if a.data_source == "alpaca"
+            else MODEL_TAG
+        )
         best_model_path = Path("models") / "best" / (model_suffix.strip("_") or "synthetic") / "best_model.zip"
         latest_model_path = Path("models") / f"ppo_options_{ticker.lower()}{model_suffix}.zip"
         model_path = best_model_path if best_model_path.exists() else latest_model_path
@@ -1319,7 +1342,7 @@ def main():
         )
         print("\n=== 145-DAY OUT-OF-SAMPLE EVALUATION (SAVED MODEL) ===")
         print(f"Ticker: {ticker}")
-        print("Initial capital: €500.00")
+        print("Initial capital: €{INITIAL_CASH:.2f}")
         print(f"Final equity: €{r['final']:,.2f}")
         print(f"P&L: €{r['pnl']:,.2f}")
         print(f"Return: {r['return_pct']:.2f}%")
