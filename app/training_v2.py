@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import shutil
 from pathlib import Path
 
@@ -575,6 +576,110 @@ def evaluate(model, data: pd.DataFrame, report_dir: Path | None = None, option_p
     }
 
 
+def compare_checkpoints(
+    ticker: str,
+    steps_a: int,
+    steps_b: int,
+    period: str = "730d",
+    data_source: str = "real",
+    options_file: str = "data/nvda_real_options.csv.gz",
+) -> None:
+    """Compare two saved PPO checkpoints on weights and deterministic OOS actions."""
+    data = load_hourly_data(ticker, period)
+    option_panel = (
+        load_option_panel(Path(options_file))
+        if data_source in {"real", "alpaca"}
+        else None
+    )
+    if data_source == "real":
+        data = align_real_data_to_option_panel(data, option_panel)
+
+    split = len(data) - EPISODE_HOURS - 1
+    test_data = data.iloc[split - LOOKBACK:].reset_index(drop=True)
+    model_suffix = (
+        "_real" if data_source == "real" else "_alpaca" if data_source == "alpaca" else ""
+    )
+    paths = [
+        CHECKPOINT_DIR / f"ppo_options_{ticker.lower()}{model_suffix}_{steps_a}_steps.zip",
+        CHECKPOINT_DIR / f"ppo_options_{ticker.lower()}{model_suffix}_{steps_b}_steps.zip",
+    ]
+    if not paths[0].exists() or not paths[1].exists():
+        raise FileNotFoundError(
+            f"Expected checkpoints: {paths[0]} and {paths[1]}"
+        )
+
+    models = [MaskablePPO.load(path, device="auto") for path in paths]
+    hashes = []
+    for model in models:
+        digest = hashlib.sha256()
+        for name, tensor in sorted(model.policy.state_dict().items()):
+            digest.update(name.encode("utf-8"))
+            digest.update(tensor.detach().cpu().numpy().tobytes())
+        hashes.append(digest.hexdigest()[:16])
+
+    actions_by_model = []
+    summaries = []
+    for model in models:
+        env = RiskManagedPPOEnv(
+            make_env(
+                test_data,
+                option_panel=option_panel,
+                fixed_start=LOOKBACK,
+                episode_hours=EPISODE_HOURS,
+            )
+        )
+        obs, _ = env.reset(seed=123)
+        terminated = False
+        truncated = False
+        actions = []
+        while not (terminated or truncated):
+            masks = get_action_masks(env)
+            action, _ = model.predict(
+                obs,
+                deterministic=True,
+                action_masks=masks,
+            )
+            action = int(np.asarray(action).item())
+            actions.append(action)
+            obs, _, terminated, truncated, _ = env.step(action)
+        actions_by_model.append(actions)
+        summaries.append(
+            {
+                "return_pct": float((env.equity / 500.0 - 1.0) * 100.0),
+                "max_drawdown_pct": float(
+                    -max(
+                        (
+                            max(0.0, (peak - value) / max(peak, 1e-9))
+                            for peak, value in zip(
+                                np.maximum.accumulate([500.0] + [
+                                    float(x) for x in [500.0]
+                                ]),
+                                [500.0],
+                            )
+                        ),
+                        default=0.0,
+                    )
+                ),
+                "trades": len(env.trade_log),
+            }
+        )
+
+    action_a = actions_by_model[0]
+    action_b = actions_by_model[1]
+    common = min(len(action_a), len(action_b))
+    differing = sum(a != b for a, b in zip(action_a[:common], action_b[:common]))
+    print(f"Checkpoint A: {paths[0]} | timesteps {models[0].num_timesteps:,} | policy hash {hashes[0]}")
+    print(f"Checkpoint B: {paths[1]} | timesteps {models[1].num_timesteps:,} | policy hash {hashes[1]}")
+    print(
+        f"Deterministic OOS actions: {differing}/{common} differ "
+        f"({(differing / common * 100.0) if common else 0.0:.2f}%)"
+    )
+    print(f"A action counts: HOLD {sum(a == 0 for a in action_a)} | CLOSE {sum(a == 1 for a in action_a)} | OPEN {sum(a >= 2 for a in action_a)}")
+    print(f"B action counts: HOLD {sum(a == 0 for a in action_b)} | CLOSE {sum(a == 1 for a in action_b)} | OPEN {sum(a >= 2 for a in action_b)}")
+    print(f"A OOS return: {summaries[0]['return_pct']:.2f}% | trades {summaries[0]['trades']}")
+    print(f"B OOS return: {summaries[1]['return_pct']:.2f}% | trades {summaries[1]['trades']}")
+
+
 def evaluate_baselines(oos_data: pd.DataFrame) -> dict:
     """Compute simple non-RL reference returns for the exact OOS window."""
     start = LOOKBACK
@@ -1098,11 +1203,21 @@ def main():
     p.add_argument("--max-drawdown", type=float, default=MAX_DRAWDOWN_LIMIT, help="Hard account drawdown stop as a fraction (default 0.25).")
     p.add_argument("--risk-sweep", action="store_true", help="Evaluate the saved model at 10%, 15%, 20%, and 25% drawdown limits without training.")
     p.add_argument("--validation-risk-sweep", action="store_true", help="Evaluate the saved model on the pre-OOS validation block at multiple drawdown limits without training.")
+    p.add_argument("--compare-checkpoints", nargs=2, type=int, metavar=("A", "B"), help="Compare two generalized-v4 checkpoints on weights and deterministic OOS actions.")
     p.add_argument("--data-source", choices=["synthetic", "alpaca", "real"], default="real", help="Options data source (default: real OPRA panel).")
     p.add_argument("--options-file", default="data/nvda_real_options.csv.gz", help="Real/alpaca options panel path.")
     a = p.parse_args()
     ticker = a.ticker.upper()
-    if a.validation_risk_sweep:
+    if a.compare_checkpoints:
+        compare_checkpoints(
+            ticker,
+            a.compare_checkpoints[0],
+            a.compare_checkpoints[1],
+            period=a.period,
+            data_source=a.data_source,
+            options_file=a.options_file,
+        )
+    elif a.validation_risk_sweep:
         validation_data, option_panel = build_pre_oos_validation_data(
             ticker,
             period=a.period,
