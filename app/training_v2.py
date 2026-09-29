@@ -733,14 +733,17 @@ def evaluate_validation_segments(
     drawdowns = np.asarray(
         [r["max_drawdown_pct"] for r in results], dtype=float
     )
-    # Primary criterion: the median return across the validation slices.
-    # Tie-breaks favour lower median drawdown and then higher mean return.
+    # Prefer consistency across validation slices over a strong single slice.
+    # The worst segment is the primary return signal; median drawdown and mean
+    # return remain tie-break information. This still uses only pre-OOS data.
+    worst_return = float(np.min(returns))
     median_return = float(np.median(returns))
     median_drawdown = float(np.median(drawdowns))
     mean_return = float(np.mean(returns))
-    score = median_return - 0.25 * median_drawdown
+    score = worst_return - 0.25 * median_drawdown
     return {
         "score": score,
+        "worst_return_pct": worst_return,
         "median_return_pct": median_return,
         "median_drawdown_pct": median_drawdown,
         "mean_return_pct": mean_return,
@@ -816,12 +819,14 @@ def select_best_checkpoint(
         key = (
             float(summary["score"]),
             -float(summary["median_drawdown_pct"]),
+            float(summary["median_return_pct"]),
             float(summary["mean_return_pct"]),
         )
         rows.append(
             {
                 "checkpoint": str(checkpoint_path),
                 "score": float(summary["score"]),
+                "worst_return_pct": float(summary["worst_return_pct"]),
                 "median_return_pct": float(summary["median_return_pct"]),
                 "median_drawdown_pct": float(summary["median_drawdown_pct"]),
                 "mean_return_pct": float(summary["mean_return_pct"]),
@@ -848,7 +853,7 @@ def select_best_checkpoint(
     audit_dir = Path("training_eval") / "validation_selection"
     audit_dir.mkdir(parents=True, exist_ok=True)
     audit = pd.DataFrame(rows).sort_values(
-        ["score", "median_return_pct", "mean_return_pct"],
+        ["score", "worst_return_pct", "median_return_pct", "mean_return_pct"],
         ascending=False,
     )
     audit.to_csv(audit_dir / "checkpoint_selection.csv", index=False)
@@ -856,7 +861,8 @@ def select_best_checkpoint(
     chosen = audit.iloc[0]
     print(f"Selected checkpoint: {best_path}")
     print(
-        f"Validation median return: {float(chosen['median_return_pct']):.2f}% | "
+        f"Validation worst-segment return: {float(chosen['worst_return_pct']):.2f}% | "
+        f"median return: {float(chosen['median_return_pct']):.2f}% | "
         f"median max DD: {float(chosen['median_drawdown_pct']):.2f}% | "
         f"selection score: {float(chosen['score']):.2f}"
     )
