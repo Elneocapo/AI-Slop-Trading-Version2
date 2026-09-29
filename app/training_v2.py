@@ -858,11 +858,14 @@ def evaluate_validation_segments(
     worst_return = float(np.min(returns))
     median_return = float(np.median(returns))
     median_drawdown = float(np.median(drawdowns))
+    max_drawdown = float(np.max(drawdowns))
     mean_return = float(np.mean(returns))
-    # Balance profitability and risk across the validation period. Mean return
-    # carries the main signal, while drawdown has a meaningful penalty.
+    # Select for robustness rather than rewarding one strong validation slice.
+    # The worst segment is the primary return signal, and the worst drawdown
+    # receives a direct penalty so one fragile segment cannot be hidden by the
+    # median statistics.
     score = (
-        mean_return - 0.50 * median_drawdown
+        worst_return - 0.50 * max_drawdown
         if active
         else -1_000.0 - total_trades - 10.0 * active_segments
     )
@@ -874,6 +877,7 @@ def evaluate_validation_segments(
         "worst_return_pct": worst_return,
         "median_return_pct": median_return,
         "median_drawdown_pct": median_drawdown,
+        "max_drawdown_pct": max_drawdown,
         "mean_return_pct": mean_return,
         "segments": results,
     }
@@ -980,7 +984,7 @@ def select_best_checkpoint(
         key = (
             1 if bool(summary["active"]) else 0,
             float(summary["score"]),
-            -float(summary["median_drawdown_pct"]),
+            -float(summary["max_drawdown_pct"]),
             float(summary["median_return_pct"]),
             float(summary["mean_return_pct"]),
             float(summary["total_trades"]),
@@ -995,6 +999,7 @@ def select_best_checkpoint(
                 "worst_return_pct": float(summary["worst_return_pct"]),
                 "median_return_pct": float(summary["median_return_pct"]),
                 "median_drawdown_pct": float(summary["median_drawdown_pct"]),
+                "max_drawdown_pct": float(summary["max_drawdown_pct"]),
                 "mean_return_pct": float(summary["mean_return_pct"]),
                 "segment_1_return_pct": summary["segments"][0]["return_pct"]
                 if len(summary["segments"]) > 0 else np.nan,
@@ -1019,8 +1024,8 @@ def select_best_checkpoint(
     audit_dir = Path("training_eval") / "validation_selection"
     audit_dir.mkdir(parents=True, exist_ok=True)
     audit = pd.DataFrame(rows).sort_values(
-        ["score", "mean_return_pct", "median_return_pct", "worst_return_pct"],
-        ascending=False,
+        ["score", "worst_return_pct", "max_drawdown_pct", "mean_return_pct"],
+        ascending=[False, False, True, False],
     )
     audit.to_csv(audit_dir / "checkpoint_selection.csv", index=False)
 
@@ -1033,6 +1038,7 @@ def select_best_checkpoint(
         f"worst-segment return: {float(chosen['worst_return_pct']):.2f}% | "
         f"median return: {float(chosen['median_return_pct']):.2f}% | "
         f"median max DD: {float(chosen['median_drawdown_pct']):.2f}% | "
+        f"worst max DD: {float(chosen['max_drawdown_pct']):.2f}% | "
         f"selection score: {float(chosen['score']):.2f}"
     )
     print(f"Copied to: {best_model_path}")
