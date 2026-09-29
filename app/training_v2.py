@@ -756,6 +756,39 @@ def evaluate_validation_segments(
     }
 
 
+
+def build_pre_oos_validation_data(
+    ticker: str,
+    period: str = "730d",
+    data_source: str = "real",
+    options_file: str = "data/nvda_real_options.csv.gz",
+) -> tuple[pd.DataFrame, pd.DataFrame | None]:
+    """Build the pre-OOS validation block without touching the final holdout."""
+    data = load_hourly_data(ticker, period)
+    option_panel = (
+        load_option_panel(Path(options_file))
+        if data_source in {"real", "alpaca"}
+        else None
+    )
+    if data_source == "real":
+        data = align_real_data_to_option_panel(data, option_panel)
+
+    minimum_required = (
+        TRAIN_EPISODE_HOURS + LOOKBACK + VALIDATION_HOURS + LOOKBACK + 2
+    )
+    if len(data) <= minimum_required:
+        raise ValueError(
+            f"Not enough hourly history. Need more than {minimum_required} candles "
+            "for training + validation + untouched OOS."
+        )
+
+    oos_split = len(data) - EPISODE_HOURS - 1
+    pre_oos = data.iloc[:oos_split].reset_index(drop=True)
+    validation_start = len(pre_oos) - VALIDATION_HOURS - 1
+    validation_data = pre_oos.iloc[validation_start - LOOKBACK:].reset_index(drop=True)
+    return validation_data, option_panel
+
+
 def select_best_checkpoint(
     ticker: str,
     period: str = "730d",
@@ -1049,11 +1082,41 @@ def main():
     p.add_argument("--select-best", action="store_true", help="Select the best saved checkpoint using pre-OOS validation only.")
     p.add_argument("--max-drawdown", type=float, default=MAX_DRAWDOWN_LIMIT, help="Hard account drawdown stop as a fraction (default 0.25).")
     p.add_argument("--risk-sweep", action="store_true", help="Evaluate the saved model at 10%, 15%, 20%, and 25% drawdown limits without training.")
+    p.add_argument("--validation-risk-sweep", action="store_true", help="Evaluate the saved model on the pre-OOS validation block at multiple drawdown limits without training.")
     p.add_argument("--data-source", choices=["synthetic", "alpaca", "real"], default="real", help="Options data source (default: real OPRA panel).")
     p.add_argument("--options-file", default="data/nvda_real_options.csv.gz", help="Real/alpaca options panel path.")
     a = p.parse_args()
     ticker = a.ticker.upper()
-    if a.risk_sweep:
+    if a.validation_risk_sweep:
+        validation_data, option_panel = build_pre_oos_validation_data(
+            ticker,
+            period=a.period,
+            data_source=a.data_source,
+            options_file=a.options_file,
+        )
+        model_suffix = "_real" if a.data_source == "real" else "_alpaca" if a.data_source == "alpaca" else ""
+        best_model_path = Path("models") / "best" / (model_suffix.strip("_") or "synthetic") / "best_model.zip"
+        latest_model_path = Path("models") / f"ppo_options_{ticker.lower()}{model_suffix}.zip"
+        model_path = best_model_path if best_model_path.exists() else latest_model_path
+        if not model_path.exists():
+            raise FileNotFoundError(f"Saved model not found: {model_path}")
+        model = MaskablePPO.load(model_path, device="auto")
+        print(f"Validation risk sweep model: {model_path}")
+        for limit in (0.10, 0.15, 0.20, 0.25):
+            sweep_dir = Path("training_eval") / f"validation_risk_sweep_{int(limit * 100)}"
+            r = evaluate(
+                model,
+                validation_data,
+                report_dir=sweep_dir,
+                option_panel=option_panel,
+                max_drawdown_limit=limit,
+            )
+            print(
+                f"VALIDATION DD LIMIT {limit:.0%} | return {r['return_pct']:.2f}% | "
+                f"final €{r['final']:,.2f} | max DD {r['max_drawdown_pct']:.2f}% | "
+                f"trades {r['trade_count']} | win rate {r['win_rate_pct']:.2f}%"
+            )
+    elif a.risk_sweep:
         data = load_hourly_data(ticker, a.period)
         option_panel = load_option_panel(Path(a.options_file)) if a.data_source in {"real", "alpaca"} else None
         if a.data_source == "real":
