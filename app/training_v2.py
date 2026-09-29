@@ -43,6 +43,7 @@ MIN_ENTRY_DTE_INDEX = 1  # Skip 1-DTE entries during policy learning.
 FORCED_EXIT_BEFORE_EXPIRY_STEPS = 7  # Never carry a long option into the final trading day.
 REAL_TRANSACTION_COST = 0.25  # Keep a €500 account tradable without removing the 5% risk cap.
 MAX_DRAWDOWN_LIMIT = 0.25
+MIN_VALIDATION_TRADES = 3
 
 
 def make_env(data, option_panel=None, fixed_start=None, episode_hours=EPISODE_HOURS, max_drawdown_limit=MAX_DRAWDOWN_LIMIT):
@@ -738,16 +739,25 @@ def evaluate_validation_segments(
     drawdowns = np.asarray(
         [r["max_drawdown_pct"] for r in results], dtype=float
     )
-    # Prefer consistency across validation slices over a strong single slice.
-    # The worst segment is the primary return signal; median drawdown and mean
-    # return remain tie-break information. This still uses only pre-OOS data.
+    trades = np.asarray([r["trades"] for r in results], dtype=int)
+    total_trades = int(trades.sum())
+    # A no-trade checkpoint is not a useful trading policy even if its return
+    # is exactly 0%. Require a small amount of validation activity before using
+    # return/drawdown to select the model.
+    active = total_trades >= MIN_VALIDATION_TRADES
     worst_return = float(np.min(returns))
     median_return = float(np.median(returns))
     median_drawdown = float(np.median(drawdowns))
     mean_return = float(np.mean(returns))
-    score = worst_return - 0.25 * median_drawdown
+    score = (
+        worst_return - 0.25 * median_drawdown
+        if active
+        else -1_000.0 - total_trades
+    )
     return {
         "score": score,
+        "active": active,
+        "total_trades": total_trades,
         "worst_return_pct": worst_return,
         "median_return_pct": median_return,
         "median_drawdown_pct": median_drawdown,
@@ -855,15 +865,19 @@ def select_best_checkpoint(
             segments=3,
         )
         key = (
+            1 if bool(summary["active"]) else 0,
             float(summary["score"]),
             -float(summary["median_drawdown_pct"]),
             float(summary["median_return_pct"]),
             float(summary["mean_return_pct"]),
+            float(summary["total_trades"]),
         )
         rows.append(
             {
                 "checkpoint": str(checkpoint_path),
                 "score": float(summary["score"]),
+                "validation_active": bool(summary["active"]),
+                "validation_total_trades": int(summary["total_trades"]),
                 "worst_return_pct": float(summary["worst_return_pct"]),
                 "median_return_pct": float(summary["median_return_pct"]),
                 "median_drawdown_pct": float(summary["median_drawdown_pct"]),
@@ -899,7 +913,8 @@ def select_best_checkpoint(
     chosen = audit.iloc[0]
     print(f"Selected checkpoint: {best_path}")
     print(
-        f"Validation worst-segment return: {float(chosen['worst_return_pct']):.2f}% | "
+        f"Validation trades: {int(chosen['validation_total_trades'])} | "
+        f"worst-segment return: {float(chosen['worst_return_pct']):.2f}% | "
         f"median return: {float(chosen['median_return_pct']):.2f}% | "
         f"median max DD: {float(chosen['median_drawdown_pct']):.2f}% | "
         f"selection score: {float(chosen['score']):.2f}"
