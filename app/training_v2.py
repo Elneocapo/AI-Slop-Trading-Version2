@@ -1177,6 +1177,7 @@ def main():
             raise FileNotFoundError(f"Saved model not found: {model_path}")
         model = MaskablePPO.load(model_path, device="auto")
         print(f"Evaluating saved model: {model_path}")
+        print(f"Loaded PPO timesteps: {getattr(model, 'num_timesteps', 'unknown'):,}")
         r = evaluate(
             model,
             test_data,
