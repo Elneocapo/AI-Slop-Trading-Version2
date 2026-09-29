@@ -42,15 +42,17 @@ MIN_HOLDING_STEPS = 3  # Prevent immediate churn; roughly 3 hourly bars.
 MIN_ENTRY_DTE_INDEX = 1  # Skip 1-DTE entries during policy learning.
 FORCED_EXIT_BEFORE_EXPIRY_STEPS = 7  # Never carry a long option into the final trading day.
 REAL_TRANSACTION_COST = 0.25  # Keep a €500 account tradable without removing the 5% risk cap.
+MAX_DRAWDOWN_LIMIT = 0.25
 
 
-def make_env(data, option_panel=None, fixed_start=None, episode_hours=EPISODE_HOURS):
+def make_env(data, option_panel=None, fixed_start=None, episode_hours=EPISODE_HOURS, max_drawdown_limit=MAX_DRAWDOWN_LIMIT):
     env_cls = RealOptionsTradingEnv if option_panel is not None else OptionsTradingEnv
     kwargs = {
         "initial_cash": 500.0,
         "lookback": LOOKBACK,
         "episode_hours": episode_hours,
         "fixed_start": fixed_start,
+        "max_drawdown_limit": max_drawdown_limit,
     }
     if option_panel is not None:
         kwargs["transaction_cost"] = REAL_TRANSACTION_COST
@@ -478,9 +480,9 @@ def load_hourly_data(ticker: str, period: str = "730d") -> pd.DataFrame:
     return df.dropna().reset_index(drop=True)
 
 
-def evaluate(model, data: pd.DataFrame, report_dir: Path | None = None, option_panel: pd.DataFrame | None = None) -> dict:
+def evaluate(model, data: pd.DataFrame, report_dir: Path | None = None, option_panel: pd.DataFrame | None = None, max_drawdown_limit: float = MAX_DRAWDOWN_LIMIT) -> dict:
     env = RiskManagedPPOEnv(
-        make_env(data, option_panel=option_panel, fixed_start=LOOKBACK, episode_hours=EPISODE_HOURS)
+        make_env(data, option_panel=option_panel, fixed_start=LOOKBACK, episode_hours=EPISODE_HOURS, max_drawdown_limit=max_drawdown_limit)
     )
     obs, _ = env.reset(seed=123)
     terminated = False
@@ -588,7 +590,7 @@ def evaluate_baselines(oos_data: pd.DataFrame) -> dict:
     }
 
 
-def evaluate_oos_segments(model, oos_data: pd.DataFrame, option_panel: pd.DataFrame | None = None, segments: int = 3) -> list[dict]:
+def evaluate_oos_segments(model, oos_data: pd.DataFrame, option_panel: pd.DataFrame | None = None, segments: int = 3, max_drawdown_limit: float = MAX_DRAWDOWN_LIMIT) -> list[dict]:
     """Split the single 145-day OOS period into contiguous, valid segments."""
     oos_steps = len(oos_data) - LOOKBACK - 1
     segment_steps = max(50, oos_steps // segments)
@@ -615,6 +617,7 @@ def evaluate_oos_segments(model, oos_data: pd.DataFrame, option_panel: pd.DataFr
                 option_panel=option_panel,
                 episode_hours=steps,
                 fixed_start=LOOKBACK,
+                max_drawdown_limit=max_drawdown_limit,
             )
         )
         obs, _ = env.reset(seed=200 + segment_id)
@@ -660,6 +663,7 @@ def evaluate_validation_segments(
     validation_data: pd.DataFrame,
     option_panel: pd.DataFrame | None = None,
     segments: int = 3,
+    max_drawdown_limit: float = MAX_DRAWDOWN_LIMIT,
 ) -> dict:
     """Evaluate a checkpoint on contiguous pre-OOS validation slices.
 
@@ -689,6 +693,7 @@ def evaluate_validation_segments(
                 option_panel=option_panel,
                 episode_hours=steps,
                 fixed_start=LOOKBACK,
+                max_drawdown_limit=max_drawdown_limit,
             )
         )
         obs, _ = env.reset(seed=500 + segment_id)
@@ -1042,11 +1047,36 @@ def main():
     p.add_argument("--resume", action="store_true")
     p.add_argument("--eval-only", action="store_true", help="Evaluate the saved model without training.")
     p.add_argument("--select-best", action="store_true", help="Select the best saved checkpoint using pre-OOS validation only.")
+    p.add_argument("--max-drawdown", type=float, default=MAX_DRAWDOWN_LIMIT, help="Hard account drawdown stop as a fraction (default 0.25).")
+    p.add_argument("--risk-sweep", action="store_true", help="Evaluate the saved model at 10%, 15%, 20%, and 25% drawdown limits without training.")
     p.add_argument("--data-source", choices=["synthetic", "alpaca", "real"], default="real", help="Options data source (default: real OPRA panel).")
     p.add_argument("--options-file", default="data/nvda_real_options.csv.gz", help="Real/alpaca options panel path.")
     a = p.parse_args()
     ticker = a.ticker.upper()
-    if a.select_best:
+    if a.risk_sweep:
+        data = load_hourly_data(ticker, a.period)
+        option_panel = load_option_panel(Path(a.options_file)) if a.data_source in {"real", "alpaca"} else None
+        if a.data_source == "real":
+            data = align_real_data_to_option_panel(data, option_panel)
+        split = len(data) - EPISODE_HOURS - 1
+        test_data = data.iloc[split - LOOKBACK:].reset_index(drop=True)
+        model_suffix = "_real" if a.data_source == "real" else "_alpaca" if a.data_source == "alpaca" else ""
+        best_model_path = Path("models") / "best" / (model_suffix.strip("_") or "synthetic") / "best_model.zip"
+        latest_model_path = Path("models") / f"ppo_options_{ticker.lower()}{model_suffix}.zip"
+        model_path = best_model_path if best_model_path.exists() else latest_model_path
+        if not model_path.exists():
+            raise FileNotFoundError(f"Saved model not found: {model_path}")
+        model = MaskablePPO.load(model_path, device="auto")
+        print(f"Risk sweep model: {model_path}")
+        for limit in (0.10, 0.15, 0.20, 0.25):
+            sweep_dir = Path("training_eval") / f"risk_sweep_{int(limit * 100)}"
+            r = evaluate(model, test_data, report_dir=sweep_dir, option_panel=option_panel, max_drawdown_limit=limit)
+            print(
+                f"DD LIMIT {limit:.0%} | return {r['return_pct']:.2f}% | "
+                f"final €{r['final']:,.2f} | max DD {r['max_drawdown_pct']:.2f}% | "
+                f"trades {r['trade_count']} | win rate {r['win_rate_pct']:.2f}%"
+            )
+    elif a.select_best:
         select_best_checkpoint(
             ticker,
             period=a.period,
@@ -1073,6 +1103,7 @@ def main():
             test_data,
             report_dir=Path("training_eval") / "latest_oos",
             option_panel=option_panel,
+            max_drawdown_limit=a.max_drawdown,
         )
         print("\n=== 145-DAY OUT-OF-SAMPLE EVALUATION (SAVED MODEL) ===")
         print(f"Ticker: {ticker}")
@@ -1114,7 +1145,7 @@ def main():
                 f"contracts {int(trade['contracts'])} | entry €{float(trade['entry_price']):.4f} | "
                 f"exit €{float(trade['exit_price']):.4f} | {trade['reason']}"
             )
-        windows = evaluate_oos_segments(model, test_data, option_panel=option_panel)
+        windows = evaluate_oos_segments(model, test_data, option_panel=option_panel, max_drawdown_limit=a.max_drawdown)
         pd.DataFrame(windows).to_csv(Path("training_eval") / "latest_oos" / "oos_multi_window_audit.csv", index=False)
         print("OOS audit files: training_eval\\latest_oos")
         print("\n=== OOS SEGMENT CHECK (SAME 145-DAY OOS PERIOD) ===")
