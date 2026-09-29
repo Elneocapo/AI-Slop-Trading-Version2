@@ -13,13 +13,13 @@ At every decision point the agent receives the **previous 60 hourly candles** pl
 - `SELL_PUT` (open a short put)
 - `CLOSE`
 
-Each episode is approximately **145 trading days (~1,015 hourly steps)** and starts with **€500**. The environment advances one hourly candle at a time until the episode ends.
+Each episode is approximately **145 trading days (~1,015 hourly steps)** and starts with **€70** in the current small-account profile. The environment advances one hourly candle at a time until the episode ends.
 
-The reward is primarily the change in account equity. A small drawdown penalty is included so the policy is not rewarded purely for taking extreme risk. Short options use simulated margin so the €500 account cannot create unlimited leverage.
+The reward is primarily the change in account equity, scaled to the €70 account profile. A small drawdown penalty is included so the policy is not rewarded purely for taking extreme risk. Short options use simulated margin so the €500 account cannot create unlimited leverage.
 
 ## Training until a strong policy is found
 
-The default local run is **5,000,000 PPO timesteps**. Evaluation is performed every 50,000 steps and the best checkpoint is saved to:
+The current local run uses **1,000,000 PPO timesteps** with 50,000-step checkpoints. Evaluation is performed every 50,000 steps and the best checkpoint is saved to:
 
 ```text
 models/best/best_model.zip
@@ -58,7 +58,7 @@ For safety, `--resume` refuses to run if the saved model does not exist. A norma
 
 ## 145-day test
 
-The final **145-day block of historical data is held out completely from training**. After training, the model is released into that untouched chronological block, starting with €500 and the same 60-candle lookback. The program reports final equity, P&L and return.
+The final **145-day block of historical data is held out completely from training**. After training, the model is released into that untouched chronological block, starting with €70 and the same 60-candle lookback. The program reports final equity, P&L and return.
 
 This is the important test: the model does not get to train on the candles it is subsequently tested on.
 
@@ -66,7 +66,7 @@ This is the important test: the model does not get to train on the candles it is
 
 Yahoo Finance provides historical hourly **underlying** OHLCV, but not a complete historical hourly options-chain archive. The simulator therefore prices options with Black-Scholes using the historical underlying and estimated volatility. Those are **synthetic option quotes**, not claimed historical option transactions.
 
-The synthetic options layer is isolated in `app/environment/options_env.py`, so a proper historical options dataset can replace it later without changing the PPO interface.
+The current real-data profile uses the local historical OPRA panel in `data/nvda_real_options.csv.gz`, while the synthetic options layer remains isolated in `app/environment/options_env.py`.
 
 ## No broker connection
 
