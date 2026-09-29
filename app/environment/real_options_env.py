@@ -323,7 +323,7 @@ class RealOptionsTradingEnv(OptionsTradingEnv):
             return False
         position = self.position
         spot = float(self.data.loc[int(decision_t), "Close"])
-        call = position.kind in (1, -1) if position.kind in (1, -1) else position.kind in (1, 2)
+        call = position.kind in (1, 2)
         intrinsic = max(spot - position.strike, 0.0) if call else max(position.strike - spot, 0.0)
         value = intrinsic * self.multiplier * position.contracts
         if position.kind in (1, -1):
