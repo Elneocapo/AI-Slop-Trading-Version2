@@ -317,15 +317,9 @@ class RiskManagedPPOEnv(gym.Wrapper):
             self.env.t, option_type, strike_idx, dte_idx
         )
         if candidate is None or candidate["ask"] <= 0:
-            fallback = self._cheapest_affordable(option_type, risk_budget)
-            if fallback is None:
-                self.last_rejected = True
-                self.last_invalid_reason = "no_affordable_real_quote"
-                return np.array([0, option_type, strike_idx, dte_idx, 0], dtype=np.int64)
-            _, strike_idx, dte_idx = fallback
-            candidate = self.env._get_candidate_contract(
-                self.env.t, option_type, strike_idx, dte_idx
-            )
+            self.last_rejected = True
+            self.last_invalid_reason = "requested_real_quote_missing"
+            return np.array([0, option_type, strike_idx, dte_idx, 0], dtype=np.int64)
 
         if candidate is None or candidate["ask"] <= 0:
             self.last_rejected = True
