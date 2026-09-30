@@ -725,3 +725,31 @@ A future agent should inspect the current branch before relying on any value doc
 Never treat a historical OOS result as proof of live profitability.
 
 Never redownload the Databento dataset just to repeat an experiment.
+## 21. Structured RL v2 architecture (current development branch)
+
+The current next-generation RL profile is isolated from the earlier small70 checkpoints:
+
+- model tag: `_structured70_v2`
+- checkpoints: `models/checkpoints/structured70_v2`
+- evaluation capital: €70 with a 35% per-position affordability cap;
+- learning capital: €500 with a 5% affordability cap, producing approximately the same one-contract budget without training directly against tiny-account cash dynamics.
+
+The observation is now a Gymnasium Dict rather than one flattened vector:
+
+- `market`: 60 × market features, encoded by a bidirectional GRU;
+- `candidates`: 108 option candidates × 10 structured features, encoded with a small Transformer while preserving candidate/action alignment;
+- `portfolio`, `context` and `position`: separate compact MLP branches.
+
+The candidate representation uses real quote information where available (bid/ask, spread, premium scale, moneyness, DTE and bounded quote age) instead of feeding the policy synthetic Black-Scholes Greeks as the primary option-surface signal.
+
+The reward is now invariant to account size at the trade level: realized P&L is normalized by entry premium notional, and holding reward is based on causal changes in the same position value. This lets the policy learn an option-selection edge while the risk wrapper handles the €70 affordability constraint.
+
+The wrapper no longer silently substitutes a cheaper contract when the exact requested real contract is unavailable. The requested action is rejected instead, keeping the policy semantics faithful to the execution record.
+
+Episode termination now liquidates any remaining position at the last causally observable quote, so an open terminal position cannot disappear from the learning signal.
+
+PPO v2 uses `MultiInputPolicy`, a structured feature extractor, lower learning rate, smaller batches, a tighter clip range and a target-KL guard.
+
+Checkpoint selection has a hard quality gate. A checkpoint is only eligible when it has enough validation trades, activity across multiple segments, non-negative mean validation return, worst-segment return no worse than -5%, and worst validation drawdown no greater than 20%. Otherwise no `best_model.zip` is produced.
+
+This quality gate is intentionally allowed to reject the entire training run. A failed gate means the model has not demonstrated sufficient evidence of generalization and should not be connected to live money.
