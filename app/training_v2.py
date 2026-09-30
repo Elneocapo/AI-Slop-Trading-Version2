@@ -890,15 +890,18 @@ def evaluate_validation_segments(
     # A checkpoint must demonstrate activity across multiple validation
     # segments. This prevents a quiet/no-trade policy, or a one-window lucky
     # policy, from winning the selection just because 0% beats a small loss.
-    active = (
-        total_trades >= MIN_VALIDATION_TRADES
-        and active_segments >= MIN_ACTIVE_VALIDATION_SEGMENTS
-    )
     worst_return = float(np.min(returns))
     median_return = float(np.median(returns))
     median_drawdown = float(np.median(drawdowns))
     max_drawdown = float(np.max(drawdowns))
     mean_return = float(np.mean(returns))
+    active = (
+        total_trades >= MIN_VALIDATION_TRADES
+        and active_segments >= MIN_ACTIVE_VALIDATION_SEGMENTS
+        and mean_return >= MIN_VALIDATION_MEAN_RETURN_PCT
+        and worst_return >= MIN_VALIDATION_WORST_RETURN_PCT
+        and max_drawdown <= MAX_VALIDATION_WORST_DRAWDOWN_PCT
+    )
     # Select for robustness rather than rewarding one strong validation slice.
     # The worst segment is the primary return signal, and the worst drawdown
     # receives a direct penalty so one fragile segment cannot be hidden by the
