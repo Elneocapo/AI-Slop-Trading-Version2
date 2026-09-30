@@ -939,7 +939,11 @@ def select_best_checkpoint(
         else None
     )
     model_suffix = (
-        "_real" if data_source == "real" else "_alpaca" if data_source == "alpaca" else ""
+        "_real" + MODEL_TAG
+        if data_source == "real"
+        else "_alpaca" + MODEL_TAG
+        if data_source == "alpaca"
+        else MODEL_TAG
     )
     if data_source == "real":
         data = align_real_data_to_option_panel(data, option_panel)
