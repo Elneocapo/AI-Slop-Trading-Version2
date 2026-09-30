@@ -489,7 +489,7 @@ class OptionsTradingEnv(gym.Env):
                                     float(dte_days) / 30.0,
                                     1.0 if call else -1.0,
                                     float(offset),
-                                    float(dte_days) / 30.0,
+                                    1.0,
                                 ]
                             )
                         else:
