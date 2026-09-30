@@ -1013,6 +1013,10 @@ def select_best_checkpoint(
     rows = []
     best_path = None
     best_key = None
+    best_dir = Path("models/best") / (model_suffix.strip("_") or "synthetic")
+    best_model_path = best_dir / "best_model.zip"
+    if best_model_path.exists():
+        best_model_path.unlink()
 
     print(
         f"Selecting among {len(candidates)} saved checkpoints using only the "
@@ -1078,9 +1082,7 @@ def select_best_checkpoint(
             f"Audit saved to {audit_dir / 'checkpoint_selection.csv'}."
         )
 
-    best_dir = Path("models/best") / (model_suffix.strip("_") or "synthetic")
     best_dir.mkdir(parents=True, exist_ok=True)
-    best_model_path = best_dir / "best_model.zip"
     shutil.copy2(best_path, best_model_path)
 
     chosen = audit[audit["validation_active"]].iloc[0]
@@ -1162,8 +1164,8 @@ def train(ticker: str, timesteps: int = DEFAULT_TIMESTEPS, period: str = "730d",
     out.mkdir(exist_ok=True)
     logs = Path("training_eval")
     logs.mkdir(exist_ok=True)
-    best = out / "best" / (model_suffix.strip("_") or "synthetic")
-    best.mkdir(parents=True, exist_ok=True)
+    callback_best = out / "callback_best" / (model_suffix.strip("_") or "synthetic")
+    callback_best.mkdir(parents=True, exist_ok=True)
     path = out / f"ppo_options_{ticker.lower()}{model_suffix}"
     CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
     checkpoint = CheckpointCallback(
@@ -1173,7 +1175,7 @@ def train(ticker: str, timesteps: int = DEFAULT_TIMESTEPS, period: str = "730d",
     )
     eval_callback = MaskableEvalCallback(
         eval_env,
-        best_model_save_path=str(best),
+        best_model_save_path=str(callback_best),
         log_path=str(logs),
         eval_freq=50_000,
         n_eval_episodes=1,
@@ -1279,7 +1281,7 @@ def train(ticker: str, timesteps: int = DEFAULT_TIMESTEPS, period: str = "730d",
     print(f"OOS audit files: {report_dir}")
     print("No closed trades recorded in the out-of-sample test." if not r["trades"] else "Trade log recorded.")
     print(f"Model saved: {path}.zip")
-    print(f"Best checkpoint: {best / 'best_model.zip'}")
+    print(f"Selected best checkpoint: {best_model_path}")
     return path
 
 
