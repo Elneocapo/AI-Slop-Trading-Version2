@@ -364,14 +364,20 @@ class RiskManagedPPOEnv(gym.Wrapper):
         obs, base_reward, terminated, truncated, info = self.env.step(translated)
         opened_position = (not had_position) and (self.env.position is not None)
 
-        # Primary signal: realized P&L on completed trades.
         reward = 0.0
         new_trades = self.env.trade_log[trades_before:]
         if new_trades:
-            realized_pnl = sum(float(trade.get("pnl", 0.0)) for trade in new_trades)
-            reward = TRADE_REWARD_WEIGHT * float(
-                np.tanh(realized_pnl / REWARD_PNL_SCALE)
-            )
+            for trade in new_trades:
+                pnl = float(trade.get("pnl", 0.0))
+                entry_notional = max(
+                    float(trade.get("entry_price", 0.0))
+                    * float(self.env.multiplier)
+                    * max(int(trade.get("contracts", 1)), 1),
+                    1e-6,
+                )
+                reward += TRADE_REWARD_WEIGHT * float(
+                    np.tanh((pnl / entry_notional) / TRADE_RETURN_SCALE)
+                )
 
             trailing_losses = 0
             for trade in reversed(self.env.trade_log):
@@ -383,34 +389,38 @@ class RiskManagedPPOEnv(gym.Wrapper):
                 trailing_losses, MAX_LOSS_STREAK_FOR_PENALTY
             )
 
-            # OTM shaping stays mild so it cannot suppress a direction.
             for trade in new_trades:
                 entry_moneyness = trade.get("entry_moneyness")
                 if entry_moneyness is None or pd.isna(entry_moneyness):
                     continue
                 kind = int(trade.get("kind", 0))
                 if kind == 1:
-                    otm_distance = max(
-                        float(entry_moneyness) - OTM_PENALTY_START, 0.0
-                    )
+                    otm_distance = max(float(entry_moneyness) - OTM_PENALTY_START, 0.0)
                 elif kind == -1:
-                    otm_distance = max(
-                        -float(entry_moneyness) - OTM_PENALTY_START, 0.0
-                    )
+                    otm_distance = max(-float(entry_moneyness) - OTM_PENALTY_START, 0.0)
                 else:
                     otm_distance = 0.0
-                reward -= min(
-                    MAX_OTM_PENALTY,
-                    otm_distance * OTM_PENALTY_RATE,
-                )
+                reward -= min(MAX_OTM_PENALTY, otm_distance * OTM_PENALTY_RATE)
 
             if info.get("risk_stop", False):
                 reward -= DRAWDOWN_REWARD_PENALTY * float(info.get("drawdown", 0.0))
+        elif had_position and self.env.position is not None:
+            post_position_value = max(
+                float(self.env.equity) - float(self.env.cash),
+                0.0,
+            )
+            entry_notional = max(
+                float(self.env.position.entry_price)
+                * float(self.env.multiplier)
+                * max(int(self.env.position.contracts), 1),
+                1e-6,
+            )
+            mark_delta_return = (post_position_value - pre_position_value) / entry_notional
+            reward = POSITION_MARK_REWARD_WEIGHT * float(
+                np.tanh(mark_delta_return / POSITION_MARK_RETURN_SCALE)
+            )
 
-        elif had_position:
-            # Small causal mark-to-market signal only while holding the chosen
-            # contract; realized P&L remains the dominant learning target.
-            reward = POSITION_MARK_REWARD_WEIGHT * float(base_reward)
+        reward -= DRAWDOWN_REWARD_PENALTY * float(info.get("drawdown", 0.0))
 
         if opened_position:
             reward -= ENTRY_REWARD_PENALTY
