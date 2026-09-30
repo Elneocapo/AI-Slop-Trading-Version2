@@ -131,6 +131,7 @@ class RealOptionsTradingEnv(OptionsTradingEnv):
                 "ask": float(row.ask),
                 "mid": (float(row.bid) + float(row.ask)) / 2.0,
                 "option_type": (CALL if str(row.option_type).upper() in {"CALL", "C", "0"} else 1),
+                "timestamp_key": timestamp_key,
             }
             candidate_idx = int(row.candidate_idx)
             timestamp_key = int(row.timestamp_key)
@@ -246,8 +247,10 @@ class RealOptionsTradingEnv(OptionsTradingEnv):
 
         exact = self._candidate_quotes.get((timestamp_key, candidate_idx))
         if exact is not None:
-            self._candidate_lookup_cache[cache_key] = exact
-            return exact
+            candidate = dict(exact)
+            candidate["quote_age_hours"] = 0.0
+            self._candidate_lookup_cache[cache_key] = candidate
+            return candidate
 
         times = self._candidate_times.get(candidate_idx, [])
         if times:
@@ -257,11 +260,30 @@ class RealOptionsTradingEnv(OptionsTradingEnv):
                 if timestamp_key - quote_key <= 60 * 60 * 1_000_000_000:
                     candidate = self._candidate_quotes.get((quote_key, candidate_idx))
                     if candidate is not None:
+                        candidate = dict(candidate)
+                        candidate["quote_age_hours"] = max(
+                            (timestamp_key - quote_key) / 3_600_000_000_000,
+                            0.0,
+                        )
                         self._candidate_lookup_cache[cache_key] = candidate
                         return candidate
 
         self._candidate_lookup_cache[cache_key] = None
         return None
+
+    def _position_quote_age(self, t: int) -> float:
+        if self.position is None or self.position.symbol is None:
+            return 0.0
+        start = min(max(int(t), 0), len(self._data_timestamp_keys) - 1)
+        target_key = self._data_timestamp_keys[start]
+        for idx in range(start, max(start - 40, -1), -1):
+            key = self._data_timestamp_keys[idx]
+            if (key, self.position.symbol) in self._symbol_quotes:
+                return max(
+                    (target_key - key) / 3_600_000_000_000,
+                    0.0,
+                )
+        return 0.0
 
     def _position_bid_ask(self, t: int) -> tuple[float, float]:
         if self.position is None or self.position.symbol is None:
@@ -299,6 +321,7 @@ class RealOptionsTradingEnv(OptionsTradingEnv):
                 symbol=candidate["symbol"],
                 expiry_ts=candidate["expiry_ts"],
             )
+            self.position.candidate_idx = int(candidate["candidate_idx"])
             self.position.entry_spot = float(self.data.loc[max(self.t - 1, 0), "Close"])
         elif operation == OPEN_SHORT:
             return
@@ -375,6 +398,8 @@ class RealOptionsTradingEnv(OptionsTradingEnv):
         # Expiry is evaluated at the last observed bar, never at the newly
         # hidden t bar.
         self._settle_expiry_causal(decision_t)
+        if terminated and self.position is not None:
+            self._close(mark_t=decision_t, reason="episode_end")
 
         self.equity = self._equity(decision_t)
         self.peak_equity = max(self.peak_equity, self.equity)
