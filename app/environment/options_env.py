@@ -342,11 +342,13 @@ class OptionsTradingEnv(gym.Env):
         })
         self.position = None
 
-    def _settle_expiry(self):
-        if self.position is None or self.t < self.position.expiry_t:
+    def _settle_expiry(self, mark_t: int | None = None):
+        decision_t = max(self.t - 1, 0) if mark_t is None else int(mark_t)
+        decision_t = min(max(decision_t, 0), len(self.prices) - 1)
+        if self.position is None or decision_t < self.position.expiry_t:
             return
         position = self.position
-        spot = float(self.prices[self.t])
+        spot = float(self.prices[decision_t])
         call = position.kind in (1, 2)
         intrinsic = max(spot - position.strike, 0.0) if call else max(position.strike - spot, 0.0)
         value = intrinsic * self.multiplier * position.contracts
@@ -359,7 +361,7 @@ class OptionsTradingEnv(gym.Env):
 
         self.trade_log.append({
             "entry_t": position.entry_t,
-            "exit_t": self.t,
+            "exit_t": decision_t,
             "kind": position.kind,
             "strike": position.strike,
             "contracts": position.contracts,
@@ -569,11 +571,11 @@ class OptionsTradingEnv(gym.Env):
         if operation in (OPEN_LONG, OPEN_SHORT):
             self._open(operation, option_type, strike_idx, dte_idx, size_idx)
         elif operation == CLOSE:
-            self._close()
+            self._close(mark_t=decision_t, reason="close")
 
         self.t += 1
         terminated = self.t >= self.end_t
-        self._settle_expiry()
+        self._settle_expiry(decision_t)
         if terminated and self.position is not None:
             self._close(mark_t=decision_t, reason="episode_end")
         self.equity = self._equity(decision_t)
@@ -582,9 +584,12 @@ class OptionsTradingEnv(gym.Env):
 
         risk_stop = drawdown >= self.max_drawdown_limit
         if risk_stop and self.position is not None:
-            self._close(mark_t=self.t, reason="risk_stop")
-            self.equity = self._equity(self.t)
-            drawdown = max(0.0, (self.peak_equity - self.equity) / max(self.peak_equity, 1e-9))
+            self._close(mark_t=decision_t, reason="risk_stop")
+            self.equity = self._equity(decision_t)
+            drawdown = max(
+                0.0,
+                (self.peak_equity - self.equity) / max(self.peak_equity, 1e-9),
+            )
 
         reward = (self.equity - pre_action_equity) / self.initial_cash
         reward -= drawdown * 0.02
