@@ -99,6 +99,9 @@ class OptionsTradingEnv(gym.Env):
 
         self.candidate_count = 2 * len(STRIKE_OFFSETS) * len(DTE_DAYS)
         self.candidate_feature_count = 10
+        self.action_space = spaces.MultiDiscrete(
+            [4, 2, len(STRIKE_OFFSETS), len(DTE_DAYS), len(CONTRACT_SIZES)]
+        )
         self.observation_space = spaces.Dict(
             {
                 "market": spaces.Box(
