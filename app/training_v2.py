@@ -666,7 +666,9 @@ def compare_checkpoints(
                 option_panel=option_panel,
                 fixed_start=LOOKBACK,
                 episode_hours=EPISODE_HOURS,
-            )
+                initial_cash=INITIAL_CASH,
+            ),
+            max_trade_risk_pct=MAX_TRADE_RISK_PCT,
         )
         obs, _ = env.reset(seed=123)
         terminated = False
@@ -758,7 +760,9 @@ def evaluate_oos_segments(model, oos_data: pd.DataFrame, option_panel: pd.DataFr
                 episode_hours=steps,
                 fixed_start=LOOKBACK,
                 max_drawdown_limit=max_drawdown_limit,
-            )
+                initial_cash=INITIAL_CASH,
+            ),
+            max_trade_risk_pct=MAX_TRADE_RISK_PCT,
         )
         obs, _ = env.reset(seed=200 + segment_id)
         terminated = False
@@ -834,7 +838,9 @@ def evaluate_validation_segments(
                 episode_hours=steps,
                 fixed_start=LOOKBACK,
                 max_drawdown_limit=max_drawdown_limit,
-            )
+                initial_cash=INITIAL_CASH,
+            ),
+            max_trade_risk_pct=MAX_TRADE_RISK_PCT,
         )
         obs, _ = env.reset(seed=500 + segment_id)
         terminated = False
@@ -1120,7 +1126,13 @@ def train(ticker: str, timesteps: int = DEFAULT_TIMESTEPS, period: str = "730d",
 
     train_env = Monitor(
         RiskManagedPPOEnv(
-            make_env(fit_data, option_panel=option_panel, episode_hours=TRAIN_EPISODE_HOURS)
+            make_env(
+                fit_data,
+                option_panel=option_panel,
+                episode_hours=TRAIN_EPISODE_HOURS,
+                initial_cash=TRAINING_INITIAL_CASH,
+            ),
+            max_trade_risk_pct=TRAINING_MAX_TRADE_RISK_PCT,
         )
     )
     eval_env = Monitor(
@@ -1130,7 +1142,9 @@ def train(ticker: str, timesteps: int = DEFAULT_TIMESTEPS, period: str = "730d",
                 option_panel=option_panel,
                 episode_hours=VALIDATION_HOURS,
                 fixed_start=LOOKBACK,
-            )
+                initial_cash=INITIAL_CASH,
+            ),
+            max_trade_risk_pct=MAX_TRADE_RISK_PCT,
         )
     )
     out = Path("models")
