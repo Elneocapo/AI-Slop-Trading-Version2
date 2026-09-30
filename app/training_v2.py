@@ -1296,7 +1296,7 @@ def main():
     p.add_argument("--max-drawdown", type=float, default=MAX_DRAWDOWN_LIMIT, help="Hard account drawdown stop as a fraction (default 0.25).")
     p.add_argument("--risk-sweep", action="store_true", help="Evaluate the saved model at 10%, 15%, 20%, and 25% drawdown limits without training.")
     p.add_argument("--validation-risk-sweep", action="store_true", help="Evaluate the saved model on the pre-OOS validation block at multiple drawdown limits without training.")
-    p.add_argument("--compare-checkpoints", nargs=2, type=int, metavar=("A", "B"), help="Compare two generalized-v4 checkpoints on weights and deterministic OOS actions.")
+    p.add_argument("--compare-checkpoints", nargs=2, type=int, metavar=("A", "B"), help="Compare two v2 checkpoints on weights and deterministic OOS actions.")
     p.add_argument("--data-source", choices=["synthetic", "alpaca", "real"], default="real", help="Options data source (default: real OPRA panel).")
     p.add_argument("--options-file", default="data/nvda_real_options.csv.gz", help="Real/alpaca options panel path.")
     a = p.parse_args()
