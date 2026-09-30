@@ -122,6 +122,8 @@ class RealOptionsTradingEnv(OptionsTradingEnv):
         self._symbol_quotes: dict[tuple[int, str], tuple[float, float]] = {}
         for row in panel.itertuples(index=False):
             expiry_t = self._find_expiry_index(row.expiry)
+            candidate_idx = int(row.candidate_idx)
+            timestamp_key = int(row.timestamp_key)
             record = {
                 "symbol": str(row.symbol),
                 "strike": float(row.strike),
@@ -132,9 +134,8 @@ class RealOptionsTradingEnv(OptionsTradingEnv):
                 "mid": (float(row.bid) + float(row.ask)) / 2.0,
                 "option_type": (CALL if str(row.option_type).upper() in {"CALL", "C", "0"} else 1),
                 "timestamp_key": timestamp_key,
+                "candidate_idx": candidate_idx,
             }
-            candidate_idx = int(row.candidate_idx)
-            timestamp_key = int(row.timestamp_key)
             record["candidate_idx"] = candidate_idx
             self._candidate_quotes[(timestamp_key, candidate_idx)] = record
             self._candidate_times.setdefault(candidate_idx, []).append(timestamp_key)
