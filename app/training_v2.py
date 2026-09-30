@@ -1210,7 +1210,7 @@ def train(ticker: str, timesteps: int = DEFAULT_TIMESTEPS, period: str = "730d",
         target_kl=0.03,
         policy_kwargs={
             "features_extractor_class": StructuredOptionsExtractor,
-            "features_extractor_kwargs": {"features_dim": 536},
+            "features_extractor_kwargs": {"features_dim": 752},
             "net_arch": {"pi": [128, 64], "vf": [128, 64]},
         },
         verbose=1,
