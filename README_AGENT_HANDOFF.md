@@ -753,3 +753,14 @@ PPO v2 uses `MultiInputPolicy`, a structured feature extractor, lower learning r
 Checkpoint selection has a hard quality gate. A checkpoint is only eligible when it has enough validation trades, activity across multiple segments, non-negative mean validation return, worst-segment return no worse than -5%, and worst validation drawdown no greater than 20%. Otherwise no `best_model.zip` is produced.
 
 This quality gate is intentionally allowed to reject the entire training run. A failed gate means the model has not demonstrated sufficient evidence of generalization and should not be connected to live money.
+
+Recommended v2 training command:
+
+```powershell
+git pull
+python -m py_compile app\training_v2.py app\environment\options_env.py app\environment\real_options_env.py app\models\structured_options_extractor.py
+python -m pytest
+python train_ai.py --ticker NVDA --timesteps 1000000 --data-source real --options-file data\nvda_real_options.csv.gz
+```
+
+The v2 run creates a new `structured70_v2` checkpoint directory. Existing `small70_v1` checkpoints are not reused.
