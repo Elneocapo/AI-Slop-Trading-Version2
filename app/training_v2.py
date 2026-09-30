@@ -1055,17 +1055,9 @@ def select_best_checkpoint(
                 if len(summary["segments"]) > 2 else np.nan,
             }
         )
-        if best_key is None or key > best_key:
+        if summary["active"] and (best_key is None or key > best_key):
             best_key = key
             best_path = checkpoint_path
-
-    if best_path is None:
-        raise RuntimeError("Checkpoint selection produced no candidate.")
-
-    best_dir = Path("models/best") / (model_suffix.strip("_") or "synthetic")
-    best_dir.mkdir(parents=True, exist_ok=True)
-    best_model_path = best_dir / "best_model.zip"
-    shutil.copy2(best_path, best_model_path)
 
     audit_dir = Path("training_eval") / "validation_selection"
     audit_dir.mkdir(parents=True, exist_ok=True)
@@ -1075,7 +1067,23 @@ def select_best_checkpoint(
     )
     audit.to_csv(audit_dir / "checkpoint_selection.csv", index=False)
 
-    chosen = audit.iloc[0]
+    if best_path is None:
+        raise RuntimeError(
+            "No checkpoint passed the validation quality gate. "
+            f"Required mean return >= {MIN_VALIDATION_MEAN_RETURN_PCT:.2f}%, "
+            f"worst segment >= {MIN_VALIDATION_WORST_RETURN_PCT:.2f}%, "
+            f"worst DD <= {MAX_VALIDATION_WORST_DRAWDOWN_PCT:.2f}%, "
+            f"trades >= {MIN_VALIDATION_TRADES}, "
+            f"active segments >= {MIN_ACTIVE_VALIDATION_SEGMENTS}. "
+            f"Audit saved to {audit_dir / 'checkpoint_selection.csv'}."
+        )
+
+    best_dir = Path("models/best") / (model_suffix.strip("_") or "synthetic")
+    best_dir.mkdir(parents=True, exist_ok=True)
+    best_model_path = best_dir / "best_model.zip"
+    shutil.copy2(best_path, best_model_path)
+
+    chosen = audit[audit["validation_active"]].iloc[0]
     print(f"Selected checkpoint: {best_path}")
     print(
         f"Validation trades: {int(chosen['validation_total_trades'])} | "
