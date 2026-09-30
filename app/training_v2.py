@@ -155,6 +155,10 @@ class RiskManagedPPOEnv(gym.Wrapper):
         return self.env.equity
 
     @property
+    def initial_cash(self):
+        return self.env.initial_cash
+
+    @property
     def position(self):
         return self.env.position
 
