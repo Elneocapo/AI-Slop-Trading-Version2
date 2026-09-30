@@ -14,7 +14,7 @@ class StructuredOptionsExtractor(BaseFeaturesExtractor):
     from one very large flattened vector.
     """
 
-    def __init__(self, observation_space: spaces.Dict, features_dim: int = 536):
+    def __init__(self, observation_space: spaces.Dict, features_dim: int = 752):
         super().__init__(observation_space, features_dim)
 
         market_shape = observation_space.spaces["market"].shape
