@@ -648,6 +648,7 @@ def compare_checkpoints(
         terminated = False
         truncated = False
         actions = []
+        curve = [float(INITIAL_CASH)]
         while not (terminated or truncated):
             masks = get_action_masks(env)
             action, _ = model.predict(
@@ -658,23 +659,16 @@ def compare_checkpoints(
             action = int(np.asarray(action).item())
             actions.append(action)
             obs, _, terminated, truncated, _ = env.step(action)
+            curve.append(float(env.equity))
         actions_by_model.append(actions)
         summaries.append(
             {
                 "return_pct": float((env.equity / env.initial_cash - 1.0) * 100.0),
                 "max_drawdown_pct": float(
-                    -max(
-                        (
-                            max(0.0, (peak - value) / max(peak, 1e-9))
-                            for peak, value in zip(
-                                np.maximum.accumulate([500.0] + [
-                                    float(x) for x in [500.0]
-                                ]),
-                                [500.0],
-                            )
-                        ),
-                        default=0.0,
-                    )
+                    -np.min(
+                        (np.asarray(curve) - np.maximum.accumulate(curve))
+                        / np.maximum(np.maximum.accumulate(curve), 1e-9)
+                    ) * 100.0
                 ),
                 "trades": len(env.trade_log),
             }
@@ -765,7 +759,7 @@ def evaluate_oos_segments(model, oos_data: pd.DataFrame, option_panel: pd.DataFr
             "segment": segment_id + 1,
             "steps": steps,
             "final_equity": float(env.equity),
-            "return_pct": float((env.equity / 500.0 - 1.0) * 100.0),
+            "return_pct": float((env.equity / INITIAL_CASH - 1.0) * 100.0),
             "max_drawdown_pct": float(-drawdowns.min() * 100.0),
             "trades": len(pnls),
             "win_rate_pct": sum(p > 0 for p in pnls) / len(pnls) * 100.0 if pnls else 0.0,
