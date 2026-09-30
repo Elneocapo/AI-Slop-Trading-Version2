@@ -353,6 +353,8 @@ class RiskManagedPPOEnv(gym.Wrapper):
     def step(self, action):
         self._mask_cache_t = None
         self._mask_cache = None
+        pre_action_cash = float(self.env.cash)
+        pre_position_value = max(float(self.env.equity) - pre_action_cash, 0.0)
         if self.env.position is not None:
             remaining = max(int(self.env.position.expiry_t) - int(self.env.t), 0)
             if remaining <= FORCED_EXIT_BEFORE_EXPIRY_STEPS:
