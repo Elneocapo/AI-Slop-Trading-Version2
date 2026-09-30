@@ -98,16 +98,42 @@ class OptionsTradingEnv(gym.Env):
         self.n_features = len(self.feature_cols) + 1
 
         self.candidate_count = 2 * len(STRIKE_OFFSETS) * len(DTE_DAYS)
-        self.context_size = 8 + 8 + 9 + self.candidate_count * 5
-        self.action_space = spaces.MultiDiscrete(
-            [4, 2, len(STRIKE_OFFSETS), len(DTE_DAYS), len(CONTRACT_SIZES)]
+        self.candidate_feature_count = 10
+        self.observation_space = spaces.Dict(
+            {
+                "market": spaces.Box(
+                    low=-np.inf,
+                    high=np.inf,
+                    shape=(self.lookback, self.n_features),
+                    dtype=np.float32,
+                ),
+                "portfolio": spaces.Box(
+                    low=-np.inf,
+                    high=np.inf,
+                    shape=(8,),
+                    dtype=np.float32,
+                ),
+                "context": spaces.Box(
+                    low=-np.inf,
+                    high=np.inf,
+                    shape=(8,),
+                    dtype=np.float32,
+                ),
+                "position": spaces.Box(
+                    low=-np.inf,
+                    high=np.inf,
+                    shape=(9,),
+                    dtype=np.float32,
+                ),
+                "candidates": spaces.Box(
+                    low=-np.inf,
+                    high=np.inf,
+                    shape=(self.candidate_count, self.candidate_feature_count),
+                    dtype=np.float32,
+                ),
+            }
         )
-        self.observation_space = spaces.Box(
-            low=-np.inf,
-            high=np.inf,
-            shape=(self.lookback * self.n_features + self.context_size,),
-            dtype=np.float32,
-        )
+
 
         self.t = self.lookback
         self.end_t = self.lookback + self.episode_hours
@@ -369,8 +395,10 @@ class OptionsTradingEnv(gym.Env):
         market = []
         for i in range(start, self.t):
             close = self.prices[i]
-            market.extend(self.features[i].tolist())
-            market.append(float(self.highs[i] - self.lows[i]) / max(close, 1e-9))
+            market.append(
+                self.features[i].tolist()
+                + [float(self.highs[i] - self.lows[i]) / max(close, 1e-9)]
+            )
 
         decision_t = max(self.t - 1, 0)
         equity = self._equity(decision_t)
@@ -401,28 +429,27 @@ class OptionsTradingEnv(gym.Env):
         vol = self._vol(decision_t)
         current_position_option = [0.0] * 9
         if self.position is not None:
-            call = self.position.kind in (1, 2)
-            remaining_steps = max(self.position.expiry_t - decision_t, 0)
-            greeks = self._option_greeks(
-                spot, self.position.strike, remaining_steps, vol, call
-            )
             mark = float(self._mark(decision_t))
             entry = max(float(self.position.entry_price), 1e-9)
             mark_return = (mark - entry) / entry
             entry_premium_vs_spot = entry / max(spot, 1e-9)
             moneyness = spot / max(float(self.position.strike), 1e-9) - 1.0
             time_in_trade = max(decision_t - int(self.position.entry_t), 0) / max(self.episode_hours, 1)
+            remaining_steps = max(self.position.expiry_t - decision_t, 0)
             remaining_dte = remaining_steps / (30.0 * 7.0)
+            unrealized = mark_return * entry * self.multiplier * self.position.contracts
+            in_call = 1.0 if self.position.kind in (1, 2) else -1.0
+            quote_age = float(self._position_quote_age(decision_t))
             current_position_option = [
                 mark_return,
                 entry_premium_vs_spot,
                 moneyness,
                 time_in_trade,
                 remaining_dte,
-                greeks[0] / max(spot, 1e-9),
-                greeks[1],
-                greeks[2] * spot,
-                greeks[3] / max(spot, 1e-9),
+                mark * self.multiplier * self.position.contracts / max(spot * self.multiplier, 1e-9),
+                unrealized / max(self.initial_cash, 1e-9),
+                in_call,
+                min(quote_age, 1.0),
             ]
 
         candidates = self._candidate_observation_cache.get(decision_t)
@@ -430,7 +457,6 @@ class OptionsTradingEnv(gym.Env):
             candidates = []
             for call in (True, False):
                 for offset_idx, offset in enumerate(STRIKE_OFFSETS):
-                    strike = self._strike_from_offset(spot, offset)
                     for dte_idx, dte_days in enumerate(DTE_DAYS):
                         candidate = self._get_candidate_contract(
                             self.t,
@@ -438,30 +464,61 @@ class OptionsTradingEnv(gym.Env):
                             offset_idx,
                             dte_idx,
                         )
+                        static = [
+                            1.0 if call else -1.0,
+                            float(offset),
+                            float(dte_days) / 30.0,
+                        ]
                         if (
                             candidate is None
                             or candidate["expiry_t"] is None
                             or candidate["ask"] <= 0.0
                             or candidate["bid"] < 0.0
                         ):
-                            candidates.extend([0.0] * 5)
+                            candidates.append(
+                                [
+                                    0.0,
+                                    0.0,
+                                    0.0,
+                                    0.0,
+                                    0.0,
+                                    float(offset),
+                                    float(dte_days) / 30.0,
+                                    1.0 if call else -1.0,
+                                    float(offset),
+                                    float(dte_days) / 30.0,
+                                ]
+                            )
                         else:
-                            tau_hours = max(candidate["expiry_t"] - decision_t, 0)
-                            q = self._option_greeks(spot, candidate["strike"], tau_hours, vol, call)
-                            candidates.extend([
-                                candidate["ask"] / max(spot, 1e-9), q[1], q[2] * spot,
-                                q[3] / max(spot, 1e-9), q[4] / max(spot, 1e-9),
-                            ])
+                            bid = float(candidate["bid"])
+                            ask = float(candidate["ask"])
+                            mid = 0.5 * (bid + ask)
+                            spread_pct = (ask - bid) / max(mid, 1e-9)
+                            rel_strike = float(candidate["strike"]) / max(spot, 1e-9) - 1.0
+                            candidates.append(
+                                [
+                                    1.0,
+                                    (bid / max(spot, 1e-9)) * 100.0,
+                                    (ask / max(spot, 1e-9)) * 100.0,
+                                    spread_pct,
+                                    float(np.log1p(max(mid, 0.0) * self.multiplier)),
+                                    rel_strike,
+                                    float(dte_days) / 30.0,
+                                    1.0 if call else -1.0,
+                                    float(offset),
+                                    float(candidate.get("quote_age_hours", 0.0)),
+                                ]
+                            )
             self._candidate_observation_cache[decision_t] = candidates
 
         portfolio = [
             self.cash / self.initial_cash,
             equity / self.initial_cash,
             drawdown,
-            position_flag,
-            position_pnl / self.initial_cash,
             1.0 if self.position is not None else 0.0,
+            position_pnl / self.initial_cash,
             float(self.t - start) / max(self.episode_hours, 1),
+            float(self.max_drawdown_limit),
             1.0,
         ]
         current_context = [
@@ -469,7 +526,18 @@ class OptionsTradingEnv(gym.Env):
             regular, near_open, near_close,
             0.0 if self.position is None else max(self.position.expiry_t - self.t, 0) / (30.0 * 7),
         ]
-        return np.asarray(market + portfolio + current_context + current_position_option + candidates, dtype=np.float32)
+        return {
+            "market": np.asarray(market, dtype=np.float32),
+            "portfolio": np.asarray(portfolio, dtype=np.float32),
+            "context": np.asarray(current_context, dtype=np.float32),
+            "position": np.asarray(current_position_option, dtype=np.float32),
+            "candidates": np.asarray(candidates, dtype=np.float32).reshape(
+                self.candidate_count, self.candidate_feature_count
+            ),
+        }
+
+    def _position_quote_age(self, t: int) -> float:
+        return 0.0
 
     def _equity(self, t: int) -> float:
         if self.position is None:
@@ -501,9 +569,11 @@ class OptionsTradingEnv(gym.Env):
             self._close()
 
         self.t += 1
-        self._settle_expiry()
         terminated = self.t >= self.end_t
-        self.equity = self._equity(self.t)
+        self._settle_expiry()
+        if terminated and self.position is not None:
+            self._close(mark_t=decision_t, reason="episode_end")
+        self.equity = self._equity(decision_t)
         self.peak_equity = max(self.peak_equity, self.equity)
         drawdown = max(0.0, (self.peak_equity - self.equity) / max(self.peak_equity, 1e-9))
 
