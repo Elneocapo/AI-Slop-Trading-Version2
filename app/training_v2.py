@@ -836,7 +836,7 @@ def evaluate_validation_segments(
         results.append(
             {
                 "segment": segment_id + 1,
-                "return_pct": float((env.equity / 500.0 - 1.0) * 100.0),
+                "return_pct": float((env.equity / INITIAL_CASH - 1.0) * 100.0),
                 "max_drawdown_pct": float(-drawdowns.min() * 100.0),
                 "trades": len(pnls),
                 "win_rate_pct": (
