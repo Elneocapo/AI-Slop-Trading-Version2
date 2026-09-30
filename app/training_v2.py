@@ -17,48 +17,67 @@ from stable_baselines3.common.monitor import Monitor
 
 from app.environment.options_env import CALL, CONTRACT_SIZES, DTE_DAYS, STRIKE_OFFSETS, OptionsTradingEnv
 from app.environment.real_options_env import RealOptionsTradingEnv
+from app.models.structured_options_extractor import StructuredOptionsExtractor
 
 EPISODE_HOURS = 145 * 7  # Final untouched OOS horizon.
-TRAIN_EPISODE_HOURS = 20 * 7  # Short random training episodes increase temporal variety.
-VALIDATION_HOURS = 60 * 7  # Two-month pre-OOS validation block used only for checkpoint selection.
+TRAIN_EPISODE_HOURS = 20 * 7
+VALIDATION_HOURS = 60 * 7
 LOOKBACK = 60
 
-# Small-account profile: one standard option contract should be affordable
-# without requiring an absurd fraction of capital. The previous €500/5% setup
-# allowed roughly €25 per new position; €70/35% preserves that same absolute
-# position budget while making trade P&L material on a small account.
+# Evaluation/execution profile.
 INITIAL_CASH = 70.0
 MAX_TRADE_RISK_PCT = 0.35
-REWARD_PNL_SCALE = INITIAL_CASH * 0.10  # Scale realized P&L to account size.
-MODEL_TAG = "_small70"
-CHECKPOINT_DIR = Path("models") / "checkpoints" / "small70_v1"
+
+# Learning profile: same approximate absolute one-contract budget as the
+# historical €500 / 5% setup, without training directly against tiny cash.
+TRAINING_INITIAL_CASH = 500.0
+TRAINING_MAX_TRADE_RISK_PCT = 0.05
+
+# Reward is based on return on option premium, making it account-size invariant.
+TRADE_RETURN_SCALE = 0.25
+POSITION_MARK_RETURN_SCALE = 0.10
+
+MODEL_TAG = "_structured70_v2"
+CHECKPOINT_DIR = Path("models") / "checkpoints" / "structured70_v2"
 DEFAULT_TIMESTEPS = 1_000_000
-MAX_ROUNDTRIP_COST_PCT = 0.08  # Keep round-trip costs below 8% of premium notional.
+
+MAX_ROUNDTRIP_COST_PCT = 0.08
 INVALID_ACTION_PENALTY = 0.01
 NO_POSITION_CLOSE_PENALTY = 0.002
-DRAWDOWN_REWARD_PENALTY = 0.05
-HOLDING_DECAY_PENALTY = 0.0015
-LOSS_STREAK_PENALTY = 0.003  # Mild shaping only; dense equity reward remains primary.
+DRAWDOWN_REWARD_PENALTY = 0.02
+LOSS_STREAK_PENALTY = 0.003
 MAX_LOSS_STREAK_FOR_PENALTY = 2
-OTM_PENALTY_START = 0.05  # 5% OTM is tolerated before reward shaping begins.
+OTM_PENALTY_START = 0.05
 OTM_PENALTY_RATE = 0.10
 MAX_OTM_PENALTY = 0.02
-TRADE_REWARD_WEIGHT = 1.0  # Realized trade outcome is the primary PPO signal.
-POSITION_MARK_REWARD_WEIGHT = 0.15  # Small dense signal only while a position is open.
-ENTRY_REWARD_PENALTY = 0.012  # Mild anti-churn signal applied once per new position.
-MIN_HOLDING_STEPS = 3  # Prevent immediate churn; roughly 3 hourly bars.
-MIN_ENTRY_DTE_INDEX = 1  # Skip 1-DTE entries during policy learning.
-FORCED_EXIT_BEFORE_EXPIRY_STEPS = 7  # Never carry a long option into the final trading day.
-REAL_TRANSACTION_COST = 0.25  # Round-trip fee is €0.50 per one-contract position.
+TRADE_REWARD_WEIGHT = 1.0
+POSITION_MARK_REWARD_WEIGHT = 0.20
+ENTRY_REWARD_PENALTY = 0.008
+MIN_HOLDING_STEPS = 3
+MIN_ENTRY_DTE_INDEX = 1
+FORCED_EXIT_BEFORE_EXPIRY_STEPS = 7
+REAL_TRANSACTION_COST = 0.25
 MAX_DRAWDOWN_LIMIT = 0.25
-MIN_VALIDATION_TRADES = 4
+
+# Refuse to declare a checkpoint "best" when validation is simply negative.
+MIN_VALIDATION_TRADES = 6
 MIN_ACTIVE_VALIDATION_SEGMENTS = 2
+MIN_VALIDATION_MEAN_RETURN_PCT = 0.0
+MIN_VALIDATION_WORST_RETURN_PCT = -5.0
+MAX_VALIDATION_WORST_DRAWDOWN_PCT = 20.0
 
 
-def make_env(data, option_panel=None, fixed_start=None, episode_hours=EPISODE_HOURS, max_drawdown_limit=MAX_DRAWDOWN_LIMIT):
+def make_env(
+    data,
+    option_panel=None,
+    fixed_start=None,
+    episode_hours=EPISODE_HOURS,
+    max_drawdown_limit=MAX_DRAWDOWN_LIMIT,
+    initial_cash=INITIAL_CASH,
+):
     env_cls = RealOptionsTradingEnv if option_panel is not None else OptionsTradingEnv
     kwargs = {
-        "initial_cash": INITIAL_CASH,
+        "initial_cash": float(initial_cash),
         "lookback": LOOKBACK,
         "episode_hours": episode_hours,
         "fixed_start": fixed_start,
@@ -66,7 +85,6 @@ def make_env(data, option_panel=None, fixed_start=None, episode_hours=EPISODE_HO
     }
     if option_panel is not None:
         kwargs["transaction_cost"] = REAL_TRANSACTION_COST
-    if option_panel is not None:
         kwargs["option_panel"] = option_panel
     return env_cls(data, **kwargs)
 
