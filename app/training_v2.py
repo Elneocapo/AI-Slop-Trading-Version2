@@ -1327,9 +1327,13 @@ def main():
         )
         best_model_path = Path("models") / "best" / (model_suffix.strip("_") or "synthetic") / "best_model.zip"
         latest_model_path = Path("models") / f"ppo_options_{ticker.lower()}{model_suffix}.zip"
-        model_path = best_model_path if best_model_path.exists() else latest_model_path
-        if not model_path.exists():
-            raise FileNotFoundError(f"Saved model not found: {model_path}")
+        if not best_model_path.exists():
+            raise FileNotFoundError(
+                f"No validated model is available at {best_model_path}. "
+                "Checkpoint selection must pass the validation quality gate before "
+                "an OOS evaluation is allowed."
+            )
+        model_path = best_model_path
         model = MaskablePPO.load(model_path, device="auto")
         print(f"Validation risk sweep model: {model_path}")
         for limit in (0.10, 0.15, 0.20, 0.25):
@@ -1363,9 +1367,13 @@ def main():
         )
         best_model_path = Path("models") / "best" / (model_suffix.strip("_") or "synthetic") / "best_model.zip"
         latest_model_path = Path("models") / f"ppo_options_{ticker.lower()}{model_suffix}.zip"
-        model_path = best_model_path if best_model_path.exists() else latest_model_path
-        if not model_path.exists():
-            raise FileNotFoundError(f"Saved model not found: {model_path}")
+        if not best_model_path.exists():
+            raise FileNotFoundError(
+                f"No validated model is available at {best_model_path}. "
+                "Checkpoint selection must pass the validation quality gate before "
+                "an OOS evaluation is allowed."
+            )
+        model_path = best_model_path
         model = MaskablePPO.load(model_path, device="auto")
         print(f"Risk sweep model: {model_path}")
         for limit in (0.10, 0.15, 0.20, 0.25):
@@ -1399,9 +1407,13 @@ def main():
         )
         latest_model_path = Path("models") / f"ppo_options_{ticker.lower()}{model_suffix}.zip"
         best_model_path = Path("models") / "best" / (model_suffix.strip("_") or "synthetic") / "best_model.zip"
-        model_path = best_model_path if best_model_path.exists() else latest_model_path
-        if not model_path.exists():
-            raise FileNotFoundError(f"Saved model not found: {model_path}")
+        if not best_model_path.exists():
+            raise FileNotFoundError(
+                f"No validated model is available at {best_model_path}. "
+                "Checkpoint selection must pass the validation quality gate before "
+                "an OOS evaluation is allowed."
+            )
+        model_path = best_model_path
         model = MaskablePPO.load(model_path, device="auto")
         print(f"Evaluating saved model: {model_path}")
         print(f"Loaded PPO timesteps: {getattr(model, 'num_timesteps', 'unknown'):,}")
