@@ -53,7 +53,7 @@ class StructuredOptionsExtractor(BaseFeaturesExtractor):
             dropout=0.05,
             activation="gelu",
             batch_first=True,
-            norm_first=True,
+            norm_first=False,
         )
         self.candidate_transformer = nn.TransformerEncoder(
             encoder_layer,
