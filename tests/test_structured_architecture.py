@@ -50,5 +50,5 @@ def test_structured_observation_and_extractor_shapes():
     }
     features = extractor(batch)
 
-    assert features.shape == (1, 752)
+    assert features.shape == (1, 696)
     assert torch.isfinite(features).all()
