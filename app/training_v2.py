@@ -37,8 +37,8 @@ TRAINING_MAX_TRADE_RISK_PCT = 0.05
 TRADE_RETURN_SCALE = 0.25
 POSITION_MARK_RETURN_SCALE = 0.10
 
-MODEL_TAG = "_structured70_v2"
-CHECKPOINT_DIR = Path("models") / "checkpoints" / "structured70_v2"
+MODEL_TAG = "_structured70_v3"
+CHECKPOINT_DIR = Path("models") / "checkpoints" / "structured70_v3"
 DEFAULT_TIMESTEPS = 1_000_000
 
 MAX_ROUNDTRIP_COST_PCT = 0.08
@@ -1213,7 +1213,7 @@ def train(ticker: str, timesteps: int = DEFAULT_TIMESTEPS, period: str = "730d",
         target_kl=0.03,
         policy_kwargs={
             "features_extractor_class": StructuredOptionsExtractor,
-            "features_extractor_kwargs": {"features_dim": 752},
+            "features_extractor_kwargs": {"features_dim": 696},
             "net_arch": {"pi": [128, 64], "vf": [128, 64]},
         },
         verbose=1,
