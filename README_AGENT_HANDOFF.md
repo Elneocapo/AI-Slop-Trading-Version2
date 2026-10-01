@@ -725,20 +725,22 @@ A future agent should inspect the current branch before relying on any value doc
 Never treat a historical OOS result as proof of live profitability.
 
 Never redownload the Databento dataset just to repeat an experiment.
-## 21. Structured RL v2 architecture (current development branch)
+## 21. Structured RL v3 architecture (current development branch)
 
 The current next-generation RL profile is isolated from the earlier small70 checkpoints:
 
-- model tag: `_structured70_v2`
-- checkpoints: `models/checkpoints/structured70_v2`
+- model tag: `_structured70_v3`
+- checkpoints: `models/checkpoints/structured70_v3`
 - evaluation capital: €70 with a 35% per-position affordability cap;
 - learning capital: €500 with a 5% affordability cap, producing approximately the same one-contract budget without training directly against tiny-account cash dynamics.
 
 The observation is now a Gymnasium Dict rather than one flattened vector:
 
-- `market`: 60 × market features, encoded by a bidirectional GRU;
-- `candidates`: 108 option candidates × 10 structured features, encoded with a small Transformer while preserving candidate/action alignment;
+- `market`: 60 × market features, encoded by lightweight temporal convolutions with mean/max pooling;
+- `candidates`: 108 option candidates × 10 structured features, encoded by one shared candidate network and explicitly conditioned on the current market representation;
 - `portfolio`, `context` and `position`: separate compact MLP branches.
+
+The v3 extractor deliberately avoids a Transformer over all 108 candidates. It produces four compact values per candidate, keeping the candidate/action-slot alignment while remaining practical on CPU.
 
 The candidate representation uses real quote information where available (bid/ask, spread, premium scale, moneyness, DTE and bounded quote age) instead of feeding the policy synthetic Black-Scholes Greeks as the primary option-surface signal.
 
@@ -748,7 +750,7 @@ The wrapper no longer silently substitutes a cheaper contract when the exact req
 
 Episode termination now liquidates any remaining position at the last causally observable quote, so an open terminal position cannot disappear from the learning signal.
 
-PPO v2 uses `MultiInputPolicy`, a structured feature extractor, lower learning rate, smaller batches, a tighter clip range and a target-KL guard.
+PPO v3 uses `MultiInputPolicy`, the fast structured extractor, a lower learning rate, smaller batches, a tighter clip range and a target-KL guard.
 
 Checkpoint selection has a hard quality gate. A checkpoint is only eligible when it has enough validation trades, activity across multiple segments, non-negative mean validation return, worst-segment return no worse than -5%, and worst validation drawdown no greater than 20%. Otherwise no `best_model.zip` is produced.
 
@@ -763,4 +765,4 @@ python -m pytest
 python train_ai.py --ticker NVDA --timesteps 1000000 --data-source real --options-file data\nvda_real_options.csv.gz
 ```
 
-The v2 run creates a new `structured70_v2` checkpoint directory. Existing `small70_v1` checkpoints are not reused.
+The v3 run creates a new `structured70_v3` checkpoint directory. Existing `small70_v1` and `structured70_v2` checkpoints are not reused.
