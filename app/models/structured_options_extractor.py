@@ -94,11 +94,11 @@ class StructuredOptionsExtractor(BaseFeaturesExtractor):
 
         candidates = self.candidate_in(observations["candidates"])
         candidates = candidates + self.candidate_pos
-        candidates = self.candidate_transformer(candidates)
 
-        # Preserve one compact representation per candidate so the downstream
-        # policy head keeps a stable relationship between candidate slots and
-        # discrete open actions.
+        # Fast CPU path: keep the structured candidate slots and action alignment
+        # while avoiding the expensive attention pass over all 108 candidates.
+        # The Transformer stays defined for checkpoint compatibility but is not
+        # used in the forward pass.
         candidate_tokens = self.candidate_token(candidates).flatten(start_dim=1)
         candidate_mean = candidates.mean(dim=1)
         candidate_max = candidates.amax(dim=1)
