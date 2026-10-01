@@ -999,7 +999,6 @@ def select_best_checkpoint(
                 f"ppo_options_{ticker.lower()}{model_suffix}_*_steps.zip"
             )
             if int(p.stem.rsplit("_", 2)[1]) % 50_000 == 0
-            and int(p.stem.rsplit("_", 2)[1]) >= 650_000
         ),
         key=lambda p: int(p.stem.rsplit("_", 2)[1]),
     )
@@ -1021,7 +1020,7 @@ def select_best_checkpoint(
 
     print(
         f"Selecting among {len(candidates)} saved checkpoints using only the "
-        f"{VALIDATION_HOURS}-hour pre-OOS validation block and fast-path checkpoints (>=650k)."
+        f"{VALIDATION_HOURS}-hour pre-OOS validation block and 50k-step v3 checkpoints."
     )
 
     for checkpoint_path in candidates:
